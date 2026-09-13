@@ -1,0 +1,10 @@
+node_modules/
+dist/
+logs/
+*.log
+
+# Локальный конфиг с реальными путями — в репозиторий не кладём.
+ccc-mcp.config.json
+
+# Локальный конфиг для эксперимента с permissions-хуками.
+ccc-mcp.config.hooks-test.json

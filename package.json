@@ -1,0 +1,46 @@
+{
+  "name": "ccc-mcp",
+  "version": "0.1.0",
+  "description": "Command Claude Code — MCP-мост: постановка задач локальной установке Claude Code из внешнего агента",
+  "type": "module",
+  "bin": {
+    "ccc-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "ccc-mcp.config.example.json",
+    "README.md",
+    "SETUP.md",
+    "AGENT-PROTOCOL.md",
+    "SECURITY.md",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "Basil@155 <me@basil155.ru> (https://www.basil155.ru)",
+  "homepage": "https://www.basil155.ru",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Basil155/ccc-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Basil155/ccc-mcp/issues"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/index.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
