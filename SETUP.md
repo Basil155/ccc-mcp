@@ -39,6 +39,12 @@ npm run build
 
 Результат — `dist/index.js`. Пересобирать нужно после каждого изменения в `src/`.
 
+> Если сборка сыплет десятками `TS2339: Property '…' does not exist on type 'Config'`, дело
+> почти наверняка не в схеме, а в битой установке `zod`: проверьте, что каталог
+> `node_modules/zod/v4` существует. Без него `z.infer` схлопывает `Config` в пустой тип.
+> `npm install` такое не чинит — он считает дерево актуальным; нужно
+> `rm -rf node_modules/zod && npm install`.
+
 ---
 
 ## 3. Конфиг сервера
@@ -86,9 +92,11 @@ cp ccc-mcp.config.example.json ccc-mcp.config.json
 | `hooksEnabled` | `false` | `true` — включить пооперационные разрешения (см. ниже). Экспериментально: сначала проверьте механизм вручную |
 | `sensitiveTools` | `["Bash", "Write", "Edit"]` | Какие инструменты дочернего CLI требуют одобрения. Для реальных задач практичнее `["Bash"]` |
 | `retryBudget` | `10` | Сколько отказов выдержит один и тот же вызов, прежде чем запретится до конца задачи |
+| `permissionHoldSeconds` | `120` | Сколько мост держит вызов, ждущий одобрения, прежде чем ответить отказом с просьбой повторить. Одобрение в это окно пропускает вызов с первой попытки. `0` — отказывать сразу. Максимум 900 |
 | `maxPendingRequests` | `50` | Предел числа различных запросов на разрешение в одной задаче |
 | `allowWaitCommand` | `true` | Пропускать ли синхронный `sleep N` (N ≤ 60) без одобрения — пауза, чтобы модель дождалась решения. Тот же `sleep` с `run_in_background: true` требует одобрения: он возвращается мгновенно и ждать модель не заставляет. Это разрешение моста, а не гарантия: там, где `sleep` в `Bash` запрещён политикой самого CLI, модель ждёт другим способом |
 | `autoApproveCommands` | `[]` | Команды `Bash`, проходящие без одобрения, — чтобы не подтверждать вручную десятки одинаковых `npm run typecheck` за прогон. Сравнение по **всей строке целиком** (пробелы по краям отбрасываются, внутренние — нет): `npm run typecheck && rm -rf /` не подпадает под `npm run typecheck`. Класть сюда стоит только детерминированные проверки, не тратящие деньги и не ходящие в сеть; `npm run smoke` без `--no-live` под это не подходит — он порождает дочерние процессы `claude`. Автоодобренный вызов в `permission_requests` не появляется, его след — строка лога с `"decision": "auto_allowed"` |
+| `planAutoApproveCommands` | `[]` | То же для `plan_task`: при `hooksEnabled` каждая Bash-команда планирования, кроме этого списка, ждёт оператора. Отдельный список: годное для выполнения не обязательно годится для разведки (`npm run build` пишет `dist/`). См. [docs/permissions.md](docs/permissions.md#планирование) |
 
 Переменные окружения перекрывают файл: `CCC_ALLOWED_ROOTS` (несколько путей через `;`),
 `CCC_CLAUDE_BIN`, `CCC_GIT_BIN`, `CCC_MODEL`, `CCC_TIMEOUT_MS`, `CCC_LOG_FILE`,
@@ -111,6 +119,12 @@ claude mcp add --scope user ccc-mcp -e CCC_MCP_CONFIG=D:/Projects/ccc-mcp/ccc-mc
 > Имя сервера (`ccc-mcp`) обязано идти **до** `-e`: этот флаг вариадический и иначе заберёт
 > имя себе, отвалившись с `Invalid environment variable format`.
 
+> **В PowerShell эта команда не работает.** PowerShell перехватывает `--` и не передаёт его
+> дочернему процессу, поэтому `claude` падает с `error: missing required argument 'commandOrUrl'`.
+> Токен `--%` тоже не спасает — он уходит в аргументы буквально (`unknown option '--%'`).
+> Выполняйте регистрацию из `cmd.exe`, Git Bash или WSL. Всё остальное — сборка, тесты,
+> запуск — в PowerShell работает как обычно.
+
 Проверить, что сервер зарегистрирован и отвечает:
 
 ```bash
@@ -121,6 +135,19 @@ claude mcp list
 
 Файл настроек на Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 (то есть `C:\Users\<имя>\AppData\Roaming\Claude\claude_desktop_config.json`).
+
+> **Установка из Microsoft Store (MSIX) хранит конфиг в другом месте:**
+> `%LOCALAPPDATA%\Packages\Claude_<суффикс>\LocalCache\Roaming\Claude\claude_desktop_config.json`.
+> Пакет виртуализирует `AppData\Roaming`: само приложение и процессы, запущенные из него
+> (терминал Claude Code, Git Bash), видят этот файл по пути `%APPDATA%\Claude`, а обычный
+> PowerShell или проводник — нет. Файл, созданный снаружи в настоящем `%APPDATA%\Claude`,
+> приложение не прочитает. Узнать свой вариант:
+>
+> ```powershell
+> Get-ChildItem "$env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json"
+> ```
+>
+> Нашёлся файл — правьте его; пусто — установка обычная, путь `%APPDATA%\Claude`.
 
 Добавьте секцию `mcpServers` на верхнем уровне, **сохранив** уже существующие ключи:
 
@@ -243,6 +270,15 @@ node scripts/smoke.mjs
 Сервер при старте печатает в stderr версию CLI, поддержку `--sandbox`, число корней и путь
 к конфигу — по этой строке удобно убеждаться, что подхватился нужный файл.
 
+Тест поднимает мост со своим временным конфигом, поэтому бинарь `claude` он ищет сам:
+`CCC_CLAUDE_BIN` → `claudeBin` из рабочего `ccc-mcp.config.json` → `PATH` → бинарь внутри
+npm-пакета. Выбранный путь печатается строкой `claudeBin:` в начале прогона. Если автопоиск
+промахнулся, задайте бинарь явно:
+
+```bash
+CCC_CLAUDE_BIN=/полный/путь/к/claude npm run smoke -- --no-live
+```
+
 ---
 
 ## 6. Использование из агента
@@ -275,9 +311,10 @@ plan_task  →  показать план человеку  →  approve_plan  �
 
 | Сообщение | Что делать |
 |---|---|
-| `не удалось запустить "claude"` | Указать полный путь в `claudeBin` |
-| `claudeBin указывает на .cmd-обёртку` | Windows: указать `.exe`, например `C:\Users\<имя>\.local\bin\claude.exe` |
-| `claude native binary not installed` | npm-установка без postinstall. Переставить нативным установщиком, `claudeBin` — `~/.local/bin/claude` |
+| `не удалось запустить "claude"` / `spawnSync claude ENOENT` | Указать полный путь в `claudeBin`. На Windows при npm-установке это частый случай: в `PATH` лежат только `claude.cmd`/`.ps1`, а `spawn` с `shell: false` их не видит. Переставлять Claude Code не нужно — нативный бинарь бандлится в пакет: `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe` |
+| `claudeBin указывает на .cmd-обёртку` | Указать `.exe`. Нативная установка — `C:\Users\<имя>\.local\bin\claude.exe`, npm-установка — путь из строки выше |
+| `claude native binary not installed` | npm-установка без postinstall: каталог `bin` в пакете пуст. Переставить нативным установщиком, `claudeBin` — `~/.local/bin/claude` |
+| `Cannot find module './v4/classic/external.cjs'`, либо десятки `TS2339: Property '…' does not exist on type 'Config'` | Битая установка `zod`: пакет есть, но каталога `node_modules/zod/v4` нет, из-за чего `z.infer` схлопывает `Config` в пустой тип. `npm install` это не чинит — он считает дерево актуальным. Удалить `node_modules/zod` и повторить `npm install` |
 | `git не найден` | Указать полный путь в `gitBin` (или переменной `CCC_GIT_BIN`). Проверьте строку `startup` с `component: "git"` в логе — она пишется при запуске |
 | `expected record, received array` | В `claude_desktop_config.json` ключ `mcpServers` должен быть объектом по имени сервера, а не массивом |
 | Блок `mcpServers` пропал сам | Файл правили при запущенном приложении — оно записало свою копию при выходе. Править только после ⌘Q |

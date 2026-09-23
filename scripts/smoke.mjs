@@ -10,7 +10,7 @@
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { HookBridge } from "../dist/hookBridge.js";
+import { HOOK_TIMEOUT_MARGIN_SECONDS, HookBridge } from "../dist/hookBridge.js";
 import { waitForJob } from "../dist/jobs.js";
 import { isValidBranchName } from "../dist/gitOps.js";
 import { detectPatterns, diagnose } from "../dist/diagnose.js";
@@ -23,6 +23,7 @@ import {
   toProgressView,
 } from "../dist/progressView.js";
 import { buildHookSettings, ClaudeRunner } from "../dist/runner.js";
+import { EXECUTE_SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT } from "../dist/prompts.js";
 import {
   MAX_EVENT_LINE_CHARS,
   MAX_STDERR_TAIL,
@@ -30,6 +31,17 @@ import {
   NdjsonSplitter,
 } from "../dist/stream.js";
 import { SessionRegistry } from "../dist/sessions.js";
+import {
+  diffWindowsPath,
+  expandWindowsVars,
+  isNested,
+  joinWindowsPath,
+  keepPwshPackageDir,
+  markNested,
+  NESTED_ENV_VAR,
+  pathKey,
+  scrubEnv,
+} from "../dist/env.js";
 import { resolveProjectEntry, resolveProjectFile } from "../dist/paths.js";
 import {
   mkdtempSync,
@@ -71,12 +83,70 @@ const projectDir = join(workspace, "project");
 mkdirSync(projectDir);
 writeFileSync(join(projectDir, "README.md"), "# smoke test project\n");
 
+/**
+ * Ищет пригодный для spawn бинарь claude.
+ *
+ * Тест поднимает сервер со своим временным конфигом, поэтому claudeBin из
+ * рабочего ccc-mcp.config.json сюда не попадает, а голое "claude" годится
+ * не всегда: при npm-установке в PATH лежат только обёртки claude.cmd/.ps1,
+ * которые мост отклоняет намеренно (им нужен shell: true), и spawn с
+ * shell: false даёт ENOENT. Порядок: явный CCC_CLAUDE_BIN → claudeBin из
+ * рабочего конфига → PATH → бинарь, забандленный в npm-пакет.
+ */
+function findClaudeBin() {
+  const fromEnv = process.env.CCC_CLAUDE_BIN?.trim();
+  if (fromEnv) return fromEnv;
+
+  const workingConfig = join(root, "ccc-mcp.config.json");
+  if (existsSync(workingConfig)) {
+    try {
+      // Конфиг — JSONC, комментарии перед разбором убираем.
+      const text = readFileSync(workingConfig, "utf8").replace(/^\s*\/\/.*$/gm, "");
+      const bin = JSON.parse(text).claudeBin;
+      if (typeof bin === "string" && bin.trim() && bin.trim() !== "claude") {
+        return bin.trim();
+      }
+    } catch {
+      // Битый рабочий конфиг не должен ронять тест — идём дальше по списку.
+    }
+  }
+
+  // "claude" проверяем через PATH, остальных кандидатов — по существованию файла.
+  const candidates = ["claude"];
+  if (process.env.APPDATA) {
+    candidates.push(
+      join(process.env.APPDATA, "npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+    );
+  }
+  if (process.env.USERPROFILE) {
+    candidates.push(join(process.env.USERPROFILE, ".local/bin/claude.exe"));
+  }
+  if (process.env.HOME) {
+    candidates.push(join(process.env.HOME, ".local/bin/claude"));
+  }
+
+  for (const candidate of candidates) {
+    if (candidate !== "claude" && !existsSync(candidate)) continue;
+    const probe = spawnSync(candidate, ["--version"], {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+      timeout: 20000,
+    });
+    if (!probe.error) return candidate;
+  }
+  return "claude"; // не нашли — пусть сервер сам скажет об этом внятно
+}
+
+const claudeBin = findClaudeBin();
+
 const configPath = join(workspace, "ccc-mcp.config.json");
 writeFileSync(
   configPath,
   JSON.stringify(
     {
       allowedRoots: [workspace],
+      claudeBin,
       timeoutMs: 300000,
       defaultWaitSeconds: 0,
       logFile: join(workspace, "logs", "ccc-mcp.jsonl"),
@@ -88,13 +158,20 @@ writeFileSync(
   ),
 );
 
-console.log(`Временный проект: ${projectDir}\n`);
+console.log(`Временный проект: ${projectDir}`);
+console.log(`claudeBin: ${claudeBin}\n`);
+
+// Без метки вложенности: smoke — канонический вызов, и его запускает в том числе
+// дочерний claude внутри execute_task. Унаследованная метка уронила бы сервер
+// на старте, хотя здесь он нужен как объект проверки, а не как инструмент ребёнка.
+const serverEnv = { ...process.env, CCC_MCP_CONFIG: configPath };
+delete serverEnv[NESTED_ENV_VAR];
 
 const client = new Client({ name: "ccc-mcp-smoke", version: "1.0.0" });
 const transport = new StdioClientTransport({
   command: process.execPath,
   args: [join(root, "dist", "index.js")],
-  env: { ...process.env, CCC_MCP_CONFIG: configPath },
+  env: serverEnv,
   stderr: "inherit",
 });
 
@@ -203,11 +280,22 @@ try {
     modelArg(argsFor(undefined, undefined)) === null,
     `получено: ${modelArg(argsFor(undefined, undefined))}`,
   );
+  check(
+    "алиас haiku разворачивается в полное имя — иначе CLI планирует на Sonnet",
+    modelArg(argsFor(undefined, "haiku")) === "claude-haiku-4-5" &&
+      modelArg(argsFor("haiku", undefined)) === "claude-haiku-4-5",
+    `получено: ${modelArg(argsFor(undefined, "haiku"))} / ${modelArg(argsFor("haiku", undefined))}`,
+  );
+  check(
+    "другие алиасы уходят как есть",
+    modelArg(argsFor(undefined, "opus")) === "opus",
+    `получено: ${modelArg(argsFor(undefined, "opus"))}`,
+  );
 
   console.log("\n2b. --settings с PreToolUse-хуками попадает в argv");
 
   const hookRunner = new ClaudeRunner(
-    { sandbox: "off", sensitiveTools: ["Bash", "Write", "Edit"] },
+    { sandbox: "off", sensitiveTools: ["Bash", "Write", "Edit"], permissionHoldSeconds: 120 },
     silentLogger,
   );
   const baseHookArgs = {
@@ -249,11 +337,58 @@ try {
         ),
       JSON.stringify(entries),
     );
+    // Таймаут обязан быть явным и больше удержания: истёкший таймаут CLI
+    // трактует как разрешение (fail-open).
+    check(
+      "timeout хука = удержание + запас",
+      entries.length > 0 &&
+        entries.every((e) => e.hooks[0].timeout === 120 + HOOK_TIMEOUT_MARGIN_SECONDS),
+      JSON.stringify(entries.map((e) => e.hooks[0].timeout)),
+    );
   }
+
+  // plan_task: auto-режим в планировании выключен всегда, хук — со своим
+  // набором инструментов. Без этого opus в plan-режиме сам одобрял пишущие
+  // команды (useAutoModeDuringPlan по умолчанию true).
+  const settingsOf = (argv) => {
+    const i = argv.indexOf("--settings");
+    return i === -1 ? null : JSON.parse(argv[i + 1]);
+  };
+  const planNoHook = settingsOf(
+    hookRunner.buildTaskArgs({ ...baseHookArgs, permissionMode: "plan" }),
+  );
+  check(
+    "plan без хука: --settings с useAutoModeDuringPlan: false и без хуков",
+    planNoHook?.useAutoModeDuringPlan === false && planNoHook.hooks === undefined,
+    JSON.stringify(planNoHook),
+  );
+  check(
+    "acceptEdits без хука: useAutoModeDuringPlan не передаётся",
+    settingsOf(hookRunner.buildTaskArgs(baseHookArgs)) === null,
+  );
+  const planHook = settingsOf(
+    hookRunner.buildTaskArgs({
+      ...baseHookArgs,
+      permissionMode: "plan",
+      hookUrl: "http://127.0.0.1:12345/hook/abc",
+      hookTools: ["Bash", "Monitor"],
+    }),
+  );
+  check(
+    "plan с хуком: матчеры из hookTools, а не из sensitiveTools, и auto-режим выключен",
+    planHook?.useAutoModeDuringPlan === false &&
+      (planHook.hooks?.PreToolUse ?? []).map((e) => e.matcher).join(",") === "Bash,Monitor",
+    JSON.stringify(planHook),
+  );
 
   check(
     "buildHookSettings не подставляет '*'",
-    JSON.stringify(buildHookSettings("http://x/y", ["Bash"])).includes('"matcher":"Bash"'),
+    JSON.stringify(buildHookSettings("http://x/y", ["Bash"], 0)).includes('"matcher":"Bash"'),
+  );
+  check(
+    "при нулевом удержании timeout всё равно явный",
+    buildHookSettings("http://x/y", ["Bash"], 0).hooks.PreToolUse[0].hooks[0].timeout ===
+      HOOK_TIMEOUT_MARGIN_SECONDS,
   );
 
   console.log("\n2c. HookBridge: матрица решений allow/deny/exhausted");
@@ -326,17 +461,34 @@ try {
     );
     check(
       "в причине сказано повторить тот же вызов",
-      /ПОВТОРИ РОВНО ЭТОТ ЖЕ ВЫЗОВ/.test(first.permissionDecisionReason ?? ""),
+      /повторите этот же вызов без изменений/.test(first.permissionDecisionReason ?? ""),
       first.permissionDecisionReason ?? "(пусто)",
     );
     check(
       "в причине запрещён обход",
-      /НЕ ИЩИ ОБХОДНОЙ ПУТЬ/.test(first.permissionDecisionReason ?? ""),
+      /другая команда с тем же эффектом уйдут оператору/.test(first.permissionDecisionReason ?? ""),
       first.permissionDecisionReason ?? "(пусто)",
     );
     check(
       "в причине есть шаг ожидания",
-      /ПОДОЖДИ/.test(first.permissionDecisionReason ?? ""),
+      /подождите/.test(first.permissionDecisionReason ?? ""),
+      first.permissionDecisionReason ?? "(пусто)",
+    );
+    // Прежний текст дочерняя модель приняла за prompt injection. Источник назван,
+    // приказов капсом и запрета честно сообщить о провале нет.
+    check(
+      "причина начинается с названия источника",
+      (first.permissionDecisionReason ?? "").startsWith("Мост разрешений ccc-mcp:"),
+      first.permissionDecisionReason ?? "(пусто)",
+    );
+    check(
+      "в причине нет слов капсом",
+      !/[А-ЯЁA-Z]{4,}/.test((first.permissionDecisionReason ?? "").replace(/ccc-mcp/g, "")),
+      first.permissionDecisionReason ?? "(пусто)",
+    );
+    check(
+      "причина не запрещает сообщать о провале",
+      !/не сообщай/i.test(first.permissionDecisionReason ?? ""),
       first.permissionDecisionReason ?? "(пусто)",
     );
     check("создана одна запись", bridge.list().length === 1, JSON.stringify(bridge.list()));
@@ -503,8 +655,8 @@ try {
     const attempt3 = await hookPost(budgetBridge.url, bashCall("rm -rf /tmp/x"));
     check(
       "в пределах бюджета отказ зовёт повторить",
-      /ПОВТОРИ РОВНО ЭТОТ ЖЕ ВЫЗОВ/.test(attempt1.permissionDecisionReason ?? "") &&
-        /ПОВТОРИ РОВНО ЭТОТ ЖЕ ВЫЗОВ/.test(attempt2.permissionDecisionReason ?? ""),
+      /повторите этот же вызов без изменений/.test(attempt1.permissionDecisionReason ?? "") &&
+        /повторите этот же вызов без изменений/.test(attempt2.permissionDecisionReason ?? ""),
       attempt2.permissionDecisionReason ?? "(пусто)",
     );
     check(
@@ -519,7 +671,7 @@ try {
     );
     check(
       "в терминальной причине велено прекратить попытки",
-      /ПРЕКРАТИ попытки/.test(attempt3.permissionDecisionReason ?? ""),
+      /Повторять этот вызов больше не нужно/.test(attempt3.permissionDecisionReason ?? ""),
       attempt3.permissionDecisionReason ?? "(пусто)",
     );
 
@@ -775,6 +927,154 @@ try {
     );
   } finally {
     noAutoBridge.stopListening();
+  }
+
+  console.log("\n2e+. HookBridge: удержание вызова до решения оператора");
+  {
+    const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+    /** Ждёт появления запроса в реестре: POST асинхронный. */
+    const firstRequest = async (b) => {
+      for (let i = 0; i < 100 && b.list().length === 0; i++) await sleepMs(10);
+      return b.list()[0];
+    };
+
+    // 1. Одобрение во время удержания — allow с первой же попытки.
+    const holdLogger = recordingLogger();
+    const holdBridge = await startBridge({ holdMs: 5_000, logger: holdLogger });
+    try {
+      const pending = hookPost(holdBridge.url, bashCall("dotnet --version"));
+      const req = await firstRequest(holdBridge);
+      check("удержанный запрос виден как pending", req?.decision === "pending", JSON.stringify(req));
+      check("удержание будит ожидающих так же, как отказ", holdBridge.pendingRevision === 1);
+      const t0 = Date.now();
+      holdBridge.resolve(req.requestId, "allow");
+      const res = await pending;
+      check(
+        "одобрение отвечает удержанному вызову сразу allow",
+        res.permissionDecision === "allow" && Date.now() - t0 < 2_000,
+        JSON.stringify(res),
+      );
+      const after = holdBridge.list()[0];
+      check(
+        "удержание отказом не считается: отказов 0, пропуск один",
+        after.deniedCount === 0 && after.allowedCount === 1,
+        JSON.stringify(after),
+      );
+      const hookLogs = holdLogger.records.filter((r) => r.event === "hook");
+      check(
+        "в лог — одна запись по итогу, а не отказ на входе",
+        hookLogs.length === 1 && hookLogs[0].outcome === "allow",
+        JSON.stringify(hookLogs),
+      );
+    } finally {
+      holdBridge.stopListening();
+    }
+
+    // 2. Отказ оператора во время удержания.
+    const denyBridge = await startBridge({ holdMs: 5_000 });
+    try {
+      const pending = hookPost(denyBridge.url, bashCall("docker compose ps"));
+      const req = await firstRequest(denyBridge);
+      denyBridge.resolve(req.requestId, "deny", "не сейчас");
+      const res = await pending;
+      check(
+        "отказ оператора отвечает удержанному вызову deny с причиной",
+        res.permissionDecision === "deny" &&
+          /оператор отклонил запрос/.test(res.permissionDecisionReason) &&
+          /не сейчас/.test(res.permissionDecisionReason),
+        JSON.stringify(res),
+      );
+      check("отказ оператора засчитан один раз", denyBridge.list()[0].deniedCount === 1);
+    } finally {
+      denyBridge.stopListening();
+    }
+
+    // 3. Истёкшее удержание — прежний отказ с просьбой повторить; повтор держится снова.
+    const timeoutBridge = await startBridge({ holdMs: 200 });
+    try {
+      const first = await hookPost(timeoutBridge.url, bashCall("git diff"));
+      check(
+        "по истечении удержания — отказ «попытка 1»",
+        first.permissionDecision === "deny" && /попытка 1 из 10/.test(first.permissionDecisionReason),
+        JSON.stringify(first),
+      );
+      check(
+        "отказ после удержания говорит, сколько ждали",
+        /за [1-9]\d* с его не было/.test(first.permissionDecisionReason),
+        first.permissionDecisionReason,
+      );
+      const second = hookPost(timeoutBridge.url, bashCall("git diff"));
+      await sleepMs(50);
+      const req = timeoutBridge.list()[0];
+      check(
+        "повтор снова удержан, в отказах только истёкшая попытка",
+        req.deniedCount === 1 && req.decision === "pending",
+        JSON.stringify(req),
+      );
+      timeoutBridge.resolve(req.requestId, "allow");
+      const res = await second;
+      check("повтор одобрен во время удержания", res.permissionDecision === "allow", JSON.stringify(res));
+    } finally {
+      timeoutBridge.stopListening();
+    }
+
+    // 3b. Бюджет при удержании: считаются только истёкшие попытки, порог прежний.
+    const budgetBridge = await startBridge({ holdMs: 50, retryBudget: 2 });
+    try {
+      const r1 = await hookPost(budgetBridge.url, bashCall("make"));
+      const r2 = await hookPost(budgetBridge.url, bashCall("make"));
+      const r3 = await hookPost(budgetBridge.url, bashCall("make"));
+      const rec = budgetBridge.list()[0];
+      check(
+        "при удержании бюджет кончается на той же попытке, что и без него",
+        /попытка 1 из 2/.test(r1.permissionDecisionReason) &&
+          /попытка 2 из 2/.test(r2.permissionDecisionReason) &&
+          r3.permissionDecision === "deny" &&
+          rec.decision === "exhausted" &&
+          rec.deniedCount === 3,
+        JSON.stringify({ r1, r2, r3, rec }),
+      );
+    } finally {
+      budgetBridge.stopListening();
+    }
+
+    // 4. Обрыв соединения — не решение: запрос остаётся pending, одобрение не падает.
+    const abortBridge = await startBridge({ holdMs: 5_000 });
+    try {
+      const ac = new AbortController();
+      const aborted = fetch(abortBridge.url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(bashCall("ls -la")),
+        signal: ac.signal,
+      }).catch(() => "aborted");
+      const req = await firstRequest(abortBridge);
+      ac.abort();
+      check("обрыв клиента завершает запрос без ответа", (await aborted) === "aborted");
+      await sleepMs(50);
+      check("после обрыва запрос всё ещё pending", abortBridge.list()[0].decision === "pending");
+      let threw = false;
+      try {
+        abortBridge.resolve(req.requestId, "allow");
+      } catch {
+        threw = true;
+      }
+      check("одобрение после обрыва не падает", threw === false);
+      const retry = await hookPost(abortBridge.url, bashCall("ls -la"));
+      check("повтор после обрыва проходит по одобрению", retry.permissionDecision === "allow");
+    } finally {
+      abortBridge.stopListening();
+    }
+
+    // 5. Остановка моста во время удержания не роняет процесс.
+    const stopBridge = await startBridge({ holdMs: 5_000 });
+    const held = hookPost(stopBridge.url, bashCall("sleep-free")).then(
+      () => "answered",
+      () => "closed",
+    );
+    await firstRequest(stopBridge);
+    stopBridge.stopListening();
+    check("stopListening закрывает удержанное соединение", (await held) === "closed");
   }
 
   console.log("\n2f. approve_permission_request без включённых хуков");
@@ -2590,6 +2890,9 @@ try {
         "задача",
         "--output-format",
         "json",
+        // Не от стрима: plan-режим всегда выключает auto-режим в планировании.
+        "--settings",
+        '{"useAutoModeDuringPlan":false}',
       ]),
     JSON.stringify(legacyArgs),
   );
@@ -3586,6 +3889,113 @@ try {
   });
   check("approve_plan для неизвестной сессии отклонён", approveUnknown.isError === true);
 
+  // Так выглядел вызов через прокси, терявший session_id: SDK отбивает его
+  // до хендлера, и раньше в логе не оставалось ничего.
+  const approveNoSession = await client
+    .callTool({ name: "approve_plan", arguments: { plan_digest: "deadbeef1234" } })
+    .catch((err) => ({ isError: true, thrown: String(err) }));
+  check("approve_plan без session_id отклонён", approveNoSession.isError === true);
+  const invalidArgsLog = readFileSync(join(workspace, "logs", "ccc-mcp.jsonl"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((l) => l.event === "invalid_args" && l.tool === "approve_plan");
+  check(
+    "невалидные аргументы попали в лог как invalid_args с ключами, но без значений",
+    invalidArgsLog !== undefined &&
+      invalidArgsLog.received?.plan_digest === "string" &&
+      !("session_id" in invalidArgsLog.received) &&
+      !JSON.stringify(invalidArgsLog).includes("deadbeef1234"),
+    JSON.stringify(invalidArgsLog),
+  );
+
+  // Синоним session: обход прокси remote-devices, теряющего ключ session_id.
+  // С одним session вызов обязан пройти схему и дойти до хендлера — тогда
+  // отказ приходит от реестра сессий («неизвестна мосту»), а не -32602.
+  const smokeLog = () =>
+    readFileSync(join(workspace, "logs", "ccc-mcp.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  for (const name of ["plan_task", "approve_plan", "execute_task"]) {
+    const props = tools.find((t) => t.name === name)?.inputSchema?.properties ?? {};
+    check(
+      `${name} объявляет и session_id, и синоним session`,
+      Object.hasOwn(props, "session_id") && Object.hasOwn(props, "session"),
+      `свойства: ${Object.keys(props).join(", ")}`,
+    );
+  }
+  const approveAlias = await client.callTool({
+    name: "approve_plan",
+    arguments: { session: "00000000-0000-0000-0000-00000000a11a", plan_digest: "deadbeef1234" },
+  });
+  check(
+    "approve_plan с одним session доходит до хендлера",
+    approveAlias.isError === true &&
+      /неизвестна мосту/.test(errText(approveAlias)) &&
+      !/-32602/.test(errText(approveAlias)),
+    errText(approveAlias),
+  );
+  check(
+    "отказ по синониму залогирован с session_param: session",
+    smokeLog().some(
+      (l) =>
+        l.event === "denied" &&
+        l.tool === "approve_plan" &&
+        l.session_id === "00000000-0000-0000-0000-00000000a11a" &&
+        l.session_param === "session",
+    ),
+  );
+  const executeAlias = await client.callTool({
+    name: "execute_task",
+    arguments: {
+      task_text: "сделай что-нибудь",
+      project_dir: projectDir,
+      session: "00000000-0000-0000-0000-00000000a11a",
+    },
+  });
+  check(
+    "execute_task с одним session доходит до хендлера",
+    executeAlias.isError === true &&
+      /неизвестна|не проходила/.test(errText(executeAlias)) &&
+      !/-32602/.test(errText(executeAlias)),
+    errText(executeAlias),
+  );
+  const approveConflict = await client.callTool({
+    name: "approve_plan",
+    arguments: {
+      session_id: "00000000-0000-0000-0000-000000000001",
+      session: "00000000-0000-0000-0000-000000000002",
+      plan_digest: "deadbeef1234",
+    },
+  });
+  check(
+    "расходящиеся session_id и session отклонены схемой",
+    approveConflict.isError === true &&
+      /-32602/.test(errText(approveConflict)) &&
+      /разными значениями/.test(errText(approveConflict)),
+    errText(approveConflict),
+  );
+  const approveBothSame = await client.callTool({
+    name: "approve_plan",
+    arguments: {
+      session_id: "00000000-0000-0000-0000-000000000003",
+      session: "00000000-0000-0000-0000-000000000003",
+      plan_digest: "deadbeef1234",
+    },
+  });
+  check(
+    "совпадающие session_id и session принимаются",
+    approveBothSame.isError === true && /неизвестна мосту/.test(errText(approveBothSame)),
+    errText(approveBothSame),
+  );
+  const approveNeither = errText(approveNoSession) + (approveNoSession.thrown ?? "");
+  check(
+    "без обоих имён отказ называет синоним",
+    /session_id/.test(approveNeither) && /синоним session/.test(approveNeither),
+    approveNeither,
+  );
+
   console.log("\n5. Открытые вопросы: распознавание и блокировка одобрения");
 
   const planWithQuestions = [
@@ -3642,6 +4052,218 @@ try {
 
   const cleanRecord = registry.recordPlanned("s-clean", projectDir, "## План\nВсё ясно.", false);
   check("чистый план сразу planned", cleanRecord.state === "planned", `получено: ${cleanRecord.state}`);
+  check(
+    "подсказка плана объясняет, что ExitPlanMode нет и искать его не нужно",
+    /ExitPlanMode/.test(PLAN_SYSTEM_PROMPT) && /ToolSearch/.test(PLAN_SYSTEM_PROMPT),
+  );
+  check("в подсказке выполнения про ExitPlanMode ничего нет", !/ExitPlanMode/.test(EXECUTE_SYSTEM_PROMPT));
+  check(
+    "подсказка плана объясняет границу: менять ничего нельзя, «выполни» превращать в план",
+    /этап разведки и плана/.test(PLAN_SYSTEM_PROMPT) &&
+      /даже если настройки разрешений их пропустили бы/.test(PLAN_SYSTEM_PROMPT) &&
+      /построй план этой работы и не выполняй её/.test(PLAN_SYSTEM_PROMPT),
+  );
+  check("в подсказке выполнения границы планирования нет", !/этап разведки и плана/.test(EXECUTE_SYSTEM_PROMPT));
+
+  console.log("\n5b. Одна сессия — одна идущая задача (поддельный claude)");
+  if (process.platform === "win32") {
+    // fake-claude.mjs запускается через shebang, а мост без shell .mjs на Windows не стартует.
+    console.log("  пропущено: поддельный claude не запускается на Windows");
+  } else {
+    const fakeConfig = join(workspace, "ccc-mcp.fake.config.json");
+    writeFileSync(
+      fakeConfig,
+      JSON.stringify({
+        allowedRoots: [workspace],
+        claudeBin: join(root, "scripts", "fixtures", "fake-claude.mjs"),
+        timeoutMs: 300000,
+        defaultWaitSeconds: 0,
+        // Сценарий держит до пяти идущих задач разом; предел здесь не предмет проверки.
+        maxConcurrent: 10,
+        logFile: join(workspace, "logs", "fake.jsonl"),
+      }),
+    );
+    const fakeClient = new Client({ name: "ccc-mcp-smoke-fake", version: "1.0.0" });
+    await fakeClient.connect(
+      new StdioClientTransport({
+        command: process.execPath,
+        args: [join(root, "dist", "index.js")],
+        env: { ...serverEnv, CCC_MCP_CONFIG: fakeConfig },
+        stderr: "inherit",
+      }),
+    );
+    const fcall = (name, args) => fakeClient.callTool({ name, arguments: args });
+    const frep = (r) => JSON.parse(r.content[0].text);
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const busy = (r, processId) =>
+      r.isError === true &&
+      errText(r).includes(processId) &&
+      /get_task_status/.test(errText(r)) &&
+      /cancel_task/.test(errText(r));
+    const stopJob = async (processId) => {
+      await fcall("cancel_task", { process_id: processId });
+      for (let i = 0; i < 50; i++) {
+        const st = frep(await fcall("get_task_status", { process_id: processId }));
+        if (st.status !== "running") return st.status;
+        await pause(100);
+      }
+      return "running";
+    };
+
+    try {
+      // Новая сессия: её id известен только из строки init потока.
+      const a = frep(await fcall("plan_task", { task_text: "долгая", project_dir: projectDir }));
+      let sidA = null;
+      for (let i = 0; i < 50 && !sidA; i++) {
+        sidA = frep(await fcall("get_task_status", { process_id: a.process_id })).session_id;
+        if (!sidA) await pause(100);
+      }
+      check("задача идёт, session_id пришёл из init", a.status === "running" && !!sidA, String(sidA));
+
+      const resumeA = await fcall("plan_task", { task_text: "x", project_dir: projectDir, session_id: sidA });
+      check(
+        "продолжение сессии, созданной идущей задачей, отклонено с её process_id",
+        busy(resumeA, a.process_id),
+        errText(resumeA),
+      );
+      const resumeAlias = await fcall("plan_task", { task_text: "x", project_dir: projectDir, session: sidA });
+      check("то же через синоним session", busy(resumeAlias, a.process_id), errText(resumeAlias));
+
+      // Продолжение по id, известному сразу (--resume).
+      const X = "11111111-1111-4111-8111-111111111111";
+      const d = frep(await fcall("plan_task", { task_text: "долгая", project_dir: projectDir, session_id: X }));
+      const e = await fcall("plan_task", { task_text: "x", project_dir: projectDir, session_id: X });
+      check("второй resume той же сессии отклонён", d.status === "running" && busy(e, d.process_id), errText(e));
+
+      // Два вызова почти одновременно: бронь до первого await пропускает только один.
+      const Y = "22222222-2222-4222-8222-222222222222";
+      const pair = await Promise.all([
+        fcall("plan_task", { task_text: "долгая", project_dir: projectDir, session_id: Y }),
+        fcall("plan_task", { task_text: "долгая", project_dir: projectDir, session_id: Y }),
+      ]);
+      const started = pair.filter((r) => r.isError !== true);
+      check(
+        "из двух одновременных запусков одной сессии прошёл ровно один",
+        started.length === 1 && pair.filter((r) => r.isError === true).length === 1,
+        pair.map((r) => (r.isError ? errText(r) : "ok")).join(" | "),
+      );
+
+      // execute_task по одобренной сессии, пока её продолжает plan_task.
+      const planned = frep(
+        await fcall("plan_task", { task_text: "FINISH", project_dir: projectDir, wait_seconds: 10 }),
+      );
+      const Z = planned.session_id;
+      await fcall("approve_plan", { session_id: Z, plan_digest: planned.plan_digest });
+      const zPlan = frep(await fcall("plan_task", { task_text: "долгая", project_dir: projectDir, session_id: Z }));
+      const zExec = await fcall("execute_task", { task_text: "x", project_dir: projectDir, session_id: Z });
+      check("execute_task отклонён, пока сессию продолжает plan_task", busy(zExec, zPlan.process_id), errText(zExec));
+      const log = readFileSync(join(workspace, "logs", "fake.jsonl"), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => JSON.parse(l));
+      check(
+        "отказ по занятости залогирован как denied",
+        log.some((l) => l.event === "denied" && l.tool === "execute_task" && l.session_id === Z),
+      );
+
+      // После остановки сессия свободна, а одобрение отказ не тронул.
+      await stopJob(zPlan.process_id);
+      const zExec2 = await fcall("execute_task", { task_text: "долгая", project_dir: projectDir, session_id: Z });
+      check(
+        "после остановки execute_task стартует по тому же одобрению",
+        zExec2.isError !== true && frep(zExec2).status === "running",
+        zExec2.isError ? errText(zExec2) : "",
+      );
+      await stopJob(frep(zExec2).process_id);
+
+      await stopJob(a.process_id);
+      const resumeAfter = await fcall("plan_task", { task_text: "долгая", project_dir: projectDir, session_id: sidA });
+      check(
+        "после остановки задачи сессию можно продолжить",
+        resumeAfter.isError !== true && frep(resumeAfter).status === "running",
+        resumeAfter.isError ? errText(resumeAfter) : "",
+      );
+      if (resumeAfter.isError !== true) await stopJob(frep(resumeAfter).process_id);
+      await stopJob(d.process_id);
+      for (const r of started) await stopJob(frep(r).process_id);
+    } finally {
+      await fakeClient.close();
+    }
+  }
+
+  console.log("\nPATH дочернего claude из реестра (Windows)");
+  {
+    const src = { SystemRoot: "C:\\Windows", UserProfile: "C:\\Users\\u" };
+    check(
+      "%VAR% раскрывается без учёта регистра имени",
+      expandWindowsVars("%SYSTEMROOT%\\system32;%userprofile%\\bin", src) ===
+        "C:\\Windows\\system32;C:\\Users\\u\\bin",
+    );
+    check("неизвестная %VAR% остаётся как есть", expandWindowsVars("%NOPE%\\x", src) === "%NOPE%\\x");
+    const joined = joinWindowsPath(["%SystemRoot%\\system32;C:\\A\\;;", "c:\\a;C:\\B"], src);
+    check(
+      "HKLM+HKCU склеиваются без пустых элементов и повторов",
+      joined === "C:\\Windows\\system32;C:\\A\\;C:\\B",
+      `получено: ${joined}`,
+    );
+    const dropped = diffWindowsPath("C:\\WindowsApps\\pwsh;C:\\A;c:\\b\\;C:\\Git\\mingw64\\bin", joined);
+    check(
+      "diff показывает только добавки родителя",
+      JSON.stringify(dropped) === JSON.stringify(["C:\\WindowsApps\\pwsh", "C:\\Git\\mingw64\\bin"]),
+      `получено: ${JSON.stringify(dropped)}`,
+    );
+    check("pathKey находит «Path» в Windows-регистре", pathKey({ Path: "x", HOME: "y" }) === "Path");
+    check("pathKey без PATH даёт «PATH»", pathKey({ HOME: "y" }) === "PATH");
+
+    const pwshDir = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe";
+    const kept = keepPwshPackageDir(`${pwshDir};C:\\Windows;C:\\Git\\mingw64\\bin`, "C:\\Windows;C:\\Git\\cmd");
+    check(
+      "каталог MSIX-пакета PowerShell ставится первым — иначе раньше него найдётся алиас",
+      kept === `${pwshDir};C:\\Windows;C:\\Git\\cmd`,
+      `получено: ${kept}`,
+    );
+    check(
+      "прочие каталоги WindowsApps не переносятся",
+      keepPwshPackageDir("C:\\Program Files\\WindowsApps\\Other.App_1.0\\;C:\\Windows", "C:\\Windows") ===
+        "C:\\Windows",
+    );
+    check(
+      "без пакета PowerShell собранный PATH не меняется",
+      keepPwshPackageDir("C:\\Windows;C:\\Git\\cmd", "C:\\Windows") === "C:\\Windows",
+    );
+    check(
+      "каталог, уже есть в собранном PATH, не дублируется",
+      keepPwshPackageDir(`${pwshDir}\\`, `C:\\Windows;${pwshDir}`) === `C:\\Windows;${pwshDir}`,
+    );
+  }
+
+  console.log("\nЗапрет вложенного моста");
+  {
+    const marked = markNested({ HOME: "y" });
+    check("markNested ставит метку", marked[NESTED_ENV_VAR] === "1" && isNested(marked));
+    check("без метки не вложен", isNested({ HOME: "y" }) === false);
+    check("пустая метка не считается", isNested({ [NESTED_ENV_VAR]: "  " }) === false);
+    check(
+      "scrubEnv метку не вычищает — она доходит до внуков",
+      scrubEnv({ [NESTED_ENV_VAR]: "1", CLAUDE_X: "z" }).env[NESTED_ENV_VAR] === "1",
+    );
+    const nested = spawnSync(process.execPath, [join(root, "dist", "index.js")], {
+      env: { ...serverEnv, [NESTED_ENV_VAR]: "1" },
+      encoding: "utf8",
+      input: "",
+      timeout: 15_000,
+    });
+    check(
+      "сервер с меткой завершается сразу и с ненулевым кодом",
+      nested.status !== 0 && nested.status !== null,
+      `status=${nested.status} error=${nested.error?.code ?? ""}`,
+    );
+    check(
+      "в stderr названа причина",
+      (nested.stderr ?? "").includes(NESTED_ENV_VAR),
+      (nested.stderr ?? "").slice(0, 200),
+    );
+  }
 
   if (!live) {
     console.log("\n(режим --no-live: реальные вызовы Claude Code пропущены)");
@@ -3769,11 +4391,13 @@ try {
       });
       check("неверный plan_digest отклонён", badDigest.isError === true);
 
-      console.log("\n10. approve_plan с верным plan_digest");
+      console.log("\n10. approve_plan с верным plan_digest, через синоним session");
+      // Живой прогон одобряет через session, а выполняет через session_id:
+      // так обе формы проходят полный цикл на реальной сессии.
       const approved = report(
         await client.callTool({
           name: "approve_plan",
-          arguments: { session_id: final.session_id, plan_digest: final.plan_digest },
+          arguments: { session: final.session_id, plan_digest: final.plan_digest },
         }),
       );
       check("состояние стало approved", approved.session_state === "approved", `получено: ${approved.session_state}`);

@@ -68,7 +68,10 @@ export interface PermissionRequest {
   /** Человекочитаемая выжимка tool_input. Сырой ввод наружу не отдаём. */
   summary: string;
   decision: RequestDecision;
-  /** Сколько раз хук отказал = сколько раз модель уже пыталась. */
+  /**
+   * Сколько раз хук ответил отказом. Без удержания это число попыток; с
+   * удержанием попытка, одобренная во время ожидания, отказом не считается.
+   */
   deniedCount: number;
   /** Сколько раз вызов пропущен после одобрения. */
   allowedCount: number;
@@ -89,12 +92,37 @@ export interface HookBridgeOptions {
    * Пустой список (дефолт) полностью выключает механизм.
    */
   autoApproveCommands: string[];
+  /**
+   * Сколько держать HTTP-запрос хука открытым в ожидании решения оператора, мс.
+   * 0 (дефолт класса) — отвечать отказом сразу и полагаться на повтор моделью.
+   *
+   * Удержание снимает главную слабость схемы «отказ → повтор»: модель не обязана
+   * верить тексту отказа и ждать — вызов ждёт сам, а после одобрения проходит с
+   * первой же попытки. Отказ с просьбой повторить остаётся запасным путём на
+   * случай, когда оператор не успел.
+   *
+   * ВАЖНО: истёкший таймаут хука CLI трактует как non-blocking error и ПРОПУСКАЕТ
+   * вызов (fail-open). Поэтому мост обязан ответить сам, раньше таймаута: runner
+   * выставляет хуку timeout с запасом HOOK_TIMEOUT_MARGIN_SECONDS сверх удержания.
+   */
+  holdMs?: number;
   logger: Logger;
 }
+
+/**
+ * Запас таймаута хука сверх удержания, секунды. Покрывает задержки между
+ * отправкой ответа мостом и его разбором CLI, чтобы до fail-open дело не дошло.
+ */
+export const HOOK_TIMEOUT_MARGIN_SECONDS = 60;
 
 interface HookDecision {
   permissionDecision: "allow" | "deny";
   permissionDecisionReason: string;
+}
+
+/** Решение отложено: ждём оператора по этому запросу, не дольше holdMs. */
+interface HookHold {
+  hold: PermissionRequest;
 }
 
 export class PermissionRequestError extends Error {}
@@ -176,89 +204,91 @@ function deny(reason: string): HookDecision {
 }
 
 /**
- * Текст для случая «ждём оператора».
+ * Все тексты отказов начинаются с него: модель должна видеть, откуда пришёл
+ * отказ, а не гадать, не подброшена ли ей чужая инструкция.
+ */
+const SOURCE = "Мост разрешений ccc-mcp:";
+
+/**
+ * Текст для случая «ждём оператора» — после истёкшего удержания или без него.
  *
- * Максимально императивный по трём причинам: модель не должна искать обход, не
- * должна менять аргументы (иначе ключ перестанет совпадать) и не должна
- * объявлять задачу проваленной раньше времени.
+ * Тон сознательно спокойный и описательный. Прежняя версия — капсом,
+ * с «ОБЯЗАТЕЛЬНЫМ ПОРЯДКОМ» и «не сообщай о провале» — дочерняя модель на
+ * Windows опознала как prompt injection, не стала ждать и сдалась за
+ * 10 секунд. Поэтому здесь нет приказов: только факты о том, что происходит,
+ * почему повтор того же вызова сработает и почему замена не поможет. Решение,
+ * ждать ли или заняться пока другим, остаётся за моделью, и провал она вправе
+ * честно отразить в отчёте.
  *
- * Способ ожидания при этом намеренно не предписан. Конкретная команда здесь
- * вредна: в Claude Code standalone `sleep` в Bash блокирует политика харнесса
- * дочернего CLI — вызов не доходит даже до моста, и модель тратит ход на поиск
- * другого примитива. Формулировка «любым доступным способом» снимает этот шаг,
- * не ослабляя требование повторить тот же вызов.
+ * Требования те же: не менять аргументы (иначе ключ не совпадёт) и не искать
+ * обход (он уйдёт оператору отдельным запросом). Конкретная пауза упоминается
+ * только при allowWaitCommand: иначе мост её отклонит и сожжёт попытку. И даже
+ * тогда она не единственный вариант: харнесс дочернего CLI может запретить
+ * `sleep` раньше моста.
  */
 function pendingReason(
   requestId: string,
   attempt: number,
   budget: number,
   allowWaitCommand: boolean,
+  heldSeconds = 0,
 ): string {
-  // Ветки различаются не подробностью, а тем, что при allowWaitCommand:false
-  // упоминание паузы через Bash было бы вредным советом: мост отклонит её и
-  // сожжёт попытку.
-  const waitStep = allowWaitCommand
-    ? "2. ПОДОЖДИ перед повтором — любым способом, который работает в твоём окружении: " +
-      "синхронная пауза `sleep 30` через Bash, без `run_in_background` (мост пропускает только " +
-      "такую и только без одобрения; фоновая пауза требует одобрения наравне с прочим), " +
-      "инструмент ожидания вроде Monitor, любой другой доступный приём. Если какой-то способ " +
-      "запрещён политикой твоего окружения — молча возьми следующий; невозможность подождать " +
-      "не отменяет пункт 3."
-    : "2. ПОДОЖДИ перед повтором любым доступным способом, не связанным с этой операцией " +
-      "(инструмент ожидания, безвредное чтение файла). Паузу через Bash не предлагать: она " +
-      "тоже требует одобрения.";
+  const status =
+    heldSeconds > 0
+      ? `вызов ждёт решения оператора (запрос ${requestId}), и за ${heldSeconds} с его не было.`
+      : `вызов отправлен оператору на одобрение (запрос ${requestId}), решения пока нет.`;
+  const pause = allowWaitCommand
+    ? " Для паузы подойдёт синхронный `sleep 30` через Bash (без `run_in_background`): он " +
+      "проходит без одобрения. Если пауза в этом окружении недоступна, повтор можно сделать и сразу."
+    : "";
 
   return [
-    `ЗАПРЕЩЕНО без одобрения оператора. Это НЕ ошибка в аргументах и НЕ отказ навсегда: ` +
-      `запрос ${requestId} уже отправлен оператору, решение придёт асинхронно.`,
-    "ОБЯЗАТЕЛЬНЫЙ ПОРЯДОК ДЕЙСТВИЙ:",
-    "1. НЕ ИЩИ ОБХОДНОЙ ПУТЬ. Не подменяй этот вызов другим инструментом, другой командой, " +
-      "скриптом или любым иным способом добиться того же результата — обход будет отклонён так же.",
-    waitStep,
-    "3. ПОВТОРИ РОВНО ЭТОТ ЖЕ ВЫЗОВ, побайтово с теми же аргументами. После одобрения он пройдёт.",
-    `Менять аргументы нельзя: изменённый вызов считается новым запросом и потребует отдельного ` +
-      `одобрения. Попытка ${attempt} из ${budget}. Не сообщай о провале задачи, пока попытки не исчерпаны.`,
+    `${SOURCE} ${status} Это не ошибка в команде и не окончательный отказ.`,
+    `Одобрение привязано к точным аргументам, поэтому, чтобы продолжить, подождите и повторите ` +
+      `этот же вызов без изменений — после одобрения он пройдёт.${pause}`,
+    `Изменённый вызов или другая команда с тем же эффектом уйдут оператору новым запросом и ` +
+      `ничего не ускорят. Если задачу можно двигать без этой операции, можно заняться другими ` +
+      `шагами и вернуться к ней позже.`,
+    `Сейчас попытка ${attempt} из ${budget}; после исчерпания операция будет запрещена до конца задачи.`,
   ].join("\n");
 }
 
 function exhaustedReason(requestId: string, budget: number): string {
   return (
-    `Бюджет повторов исчерпан (${budget}). Оператор не одобрил запрос ${requestId}. ` +
-    `ПРЕКРАТИ попытки этой операции и не ищи обходных путей. Продолжи задачу без неё, ` +
-    `а в итоговом ответе явно перечисли, что осталось не сделано и почему.`
+    `${SOURCE} для запроса ${requestId} исчерпан лимит попыток (${budget}), оператор его не ` +
+    `одобрил. Повторять этот вызов больше не нужно: до конца задачи он будет отклоняться. ` +
+    `Продолжите без этой операции и укажите в итоговом отчёте, что не сделано и почему.`
   );
 }
 
 function operatorDeniedReason(requestId: string, reason: string | null): string {
-  const comment = reason && reason.trim() ? ` Причина: ${reason.trim()}` : "";
+  const comment = reason && reason.trim() ? ` Комментарий оператора: ${reason.trim()}` : "";
   return (
-    `Оператор явно отклонил запрос ${requestId}.${comment} Повторять бесполезно — вызов будет ` +
-    `отклоняться и дальше. Не ищи обходных путей: продолжи задачу без этой операции и опиши ` +
-    `в итоговом отчёте, что не сделано.`
+    `${SOURCE} оператор отклонил запрос ${requestId}.${comment} Повтор будет отклонён так же. ` +
+    `Продолжите без этой операции и укажите в итоговом отчёте, что не сделано.`
   );
 }
 
 function overflowReason(limit: number): string {
   return (
-    `Достигнут предел различных запросов на разрешение для этой задачи (${limit}). ` +
-    `ПРЕКРАТИ перебирать варианты этой операции: каждый новый набор аргументов — отдельный запрос, ` +
-    `и оператор не успевает их рассматривать. Продолжи задачу без неё и опиши в итоговом отчёте, ` +
-    `что не сделано.`
+    `${SOURCE} в этой задаче уже ${limit} разных запросов на разрешение — это предел. Каждый ` +
+    `новый набор аргументов считается отдельным запросом, и новые варианты этой операции ` +
+    `оператору уже не попадут. Продолжите без неё и укажите в итоговом отчёте, что не сделано.`
   );
 }
 
 /** Fail-closed: нераспознанное тело — отказ, а не пропуск. */
 const REASON_BAD_BODY =
-  "Запрос хука не удалось разобрать, поэтому операция отклонена. Это сбой моста, а не отказ " +
-  "оператора: повтори вызов ещё раз, ничего в нём не меняя.";
+  `${SOURCE} не удалось разобрать запрос хука, поэтому вызов отклонён. Это сбой моста, а не ` +
+  "решение оператора: повтор того же вызова, скорее всего, пройдёт.";
 
 const REASON_TOO_LARGE =
-  "Аргументы вызова слишком велики для проверки разрешений, поэтому операция отклонена. " +
-  "Разбей её на более мелкие шаги.";
+  `${SOURCE} аргументы вызова слишком велики для проверки разрешений, поэтому он отклонён. ` +
+  "Разбейте операцию на шаги поменьше.";
 
 const REASON_INTERNAL =
-  "Внутренняя ошибка проверки разрешений, поэтому операция отклонена. Повтори вызов ещё раз, " +
-  "ничего в нём не меняя.";
+  `${SOURCE} внутренняя ошибка проверки разрешений, поэтому вызов отклонён. Повтор того же ` +
+  "вызова, скорее всего, пройдёт.";
 
 export class HookBridge {
   private readonly server: Server;
@@ -293,6 +323,11 @@ export class HookBridge {
    * Пустые после trim строки отбрасываем: иначе пустая команда совпала бы с ними.
    */
   private readonly autoApprove: Set<string>;
+  /**
+   * Удерживаемые HTTP-запросы по request_id. Колбэк получает решение оператора и
+   * сам отвечает CLI; таймер удержания и обрыв соединения снимают его отсюда.
+   */
+  private readonly holds = new Map<string, Set<(decision: "allow" | "deny") => void>>();
 
   private constructor(
     private readonly opts: HookBridgeOptions,
@@ -414,6 +449,12 @@ export class HookBridge {
     record.decision = decision === "allow" ? "approved" : "denied";
     record.resolvedAt = Date.now();
     record.resolvedReason = reason?.trim() ? reason.trim() : null;
+    // Удерживаемые вызовы отвечаем сразу — ради этого их и держали.
+    const waiters = this.holds.get(requestId);
+    if (waiters) {
+      this.holds.delete(requestId);
+      for (const waiter of waiters) waiter(decision);
+    }
     return { ...record };
   }
 
@@ -424,6 +465,9 @@ export class HookBridge {
     // Завершённая задача не должна держать ожидающих: новых запросов уже не
     // будет, и подписка только удерживала бы ссылки.
     this.pendingWatchers.clear();
+    // Удерживаемые соединения закроет closeAllConnections; ответить на них уже
+    // некому — задача кончилась, — поэтому колбэки просто забываем.
+    this.holds.clear();
     this.server.close();
     this.server.closeAllConnections();
   }
@@ -463,7 +507,7 @@ export class HookBridge {
 
     req.on("end", () => {
       if (aborted) return;
-      let decision: HookDecision;
+      let decision: HookDecision | HookHold;
       try {
         decision = this.decide(Buffer.concat(chunks).toString("utf8"));
       } catch (err) {
@@ -471,11 +515,84 @@ export class HookBridge {
         this.opts.logger.stderr(`hookBridge: сбой обработчика: ${String(err)}`);
         decision = deny(REASON_INTERNAL);
       }
-      this.respond(res, decision);
+      if ("hold" in decision) {
+        this.holdUntilDecided(decision.hold, res);
+      } else {
+        this.respond(res, decision);
+      }
     });
   }
 
-  private decide(bodyText: string): HookDecision {
+  /**
+   * Держит ответ, пока оператор не решит или не истечёт holdMs.
+   *
+   * Ровно один ответ на соединение: флаг settled защищает от гонки таймера,
+   * решения оператора и обрыва. Обрыв (CLI отменил вызов, задачу сняли) — не
+   * решение: колбэк снимается, а запрос остаётся pending для следующей попытки.
+   */
+  private holdUntilDecided(record: PermissionRequest, res: ServerResponse): void {
+    const holdMs = this.opts.holdMs ?? 0;
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const release = (): void => {
+      settled = true;
+      if (timer) clearTimeout(timer);
+      const set = this.holds.get(record.requestId);
+      if (set) {
+        set.delete(onDecision);
+        if (set.size === 0) this.holds.delete(record.requestId);
+      }
+    };
+
+    const onDecision = (decision: "allow" | "deny"): void => {
+      if (settled) return;
+      release();
+      if (decision === "allow") {
+        record.allowedCount++;
+        this.log(record, "allow");
+        this.respond(res, allow(`Операция одобрена оператором (запрос ${record.requestId}).`));
+      } else {
+        record.deniedCount++;
+        this.log(record, "deny");
+        this.respond(res, deny(operatorDeniedReason(record.requestId, record.resolvedReason)));
+      }
+    };
+
+    let set = this.holds.get(record.requestId);
+    if (!set) {
+      set = new Set();
+      this.holds.set(record.requestId, set);
+    }
+    set.add(onDecision);
+
+    timer = setTimeout(() => {
+      if (settled) return;
+      release();
+      record.deniedCount++;
+      this.log(record, "deny");
+      this.respond(
+        res,
+        deny(
+          pendingReason(
+            record.requestId,
+            record.deniedCount,
+            this.opts.retryBudget,
+            this.opts.allowWaitCommand,
+            // ceil: удержание короче секунды не должно превращаться в «за 0 с».
+            Math.ceil(holdMs / 1000),
+          ),
+        ),
+      );
+    }, holdMs);
+    timer.unref();
+
+    res.on("close", () => {
+      if (!settled) release();
+    });
+  }
+
+  private decide(bodyText: string): HookDecision | HookHold {
     let payload: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(bodyText);
@@ -509,7 +626,7 @@ export class HookBridge {
     // автоодобрение от решения человека.
     if (this.isAutoApprovedCommand(toolName, toolInput)) {
       this.logAutoAllowed(toolName, toolInput);
-      return allow("Команда входит в список автоодобрения (autoApproveCommands).");
+      return allow("Команда входит в список автоодобрения оператора.");
     }
 
     const requestId = computeRequestId(toolName, toolInput);
@@ -523,6 +640,22 @@ export class HookBridge {
         existing.allowedCount++;
         this.log(existing, "allow");
         return allow(`Операция одобрена оператором (запрос ${requestId}).`);
+      }
+
+      // Удерживаемая попытка ещё не отказ: засчитается, только если ей в итоге
+      // откажут (таймер или оператор). Иначе одобренный с первого раза вызов
+      // показывал бы denied_count: 1. Порог бюджета тот же: эта попытка —
+      // deniedCount + 1-я.
+      if (existing.decision === "pending" && this.holding) {
+        if (existing.deniedCount + 1 > this.opts.retryBudget) {
+          existing.deniedCount++;
+          existing.decision = "exhausted";
+          existing.resolvedAt = now;
+          this.log(existing, "deny");
+          this.notifyPending();
+          return deny(exhaustedReason(requestId, this.opts.retryBudget));
+        }
+        return { hold: existing };
       }
 
       existing.deniedCount++;
@@ -577,7 +710,8 @@ export class HookBridge {
       toolName,
       summary: summarizeToolInput(toolName, toolInput),
       decision: "pending",
-      deniedCount: 1,
+      // При удержании отказа пока не было — см. ветку pending выше.
+      deniedCount: this.holding ? 0 : 1,
       allowedCount: 0,
       firstSeenAt: now,
       lastSeenAt: now,
@@ -585,10 +719,20 @@ export class HookBridge {
       resolvedReason: null,
     };
     this.requests.set(requestId, created);
-    this.log(created, "deny");
     // Главное место пробуждения: именно здесь у оператора появляется работа.
+    // При удержании лог пишется по итогу — одобрением или отказом по таймеру.
+    if (this.holding) {
+      this.notifyPending();
+      return { hold: created };
+    }
+    this.log(created, "deny");
     this.notifyPending();
     return deny(pendingReason(requestId, 1, this.opts.retryBudget, this.opts.allowWaitCommand));
+  }
+
+  /** Держать ли ответ в ожидании оператора, а не отказывать сразу. */
+  private get holding(): boolean {
+    return (this.opts.holdMs ?? 0) > 0;
   }
 
   private isWaitCommand(toolName: string, toolInput: unknown): boolean {

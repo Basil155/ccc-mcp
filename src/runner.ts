@@ -1,7 +1,14 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { extname } from "node:path";
 import type { Config } from "./config.js";
-import { scrubEnv } from "./env.js";
+import {
+  buildChildPathFromRegistry,
+  markNested,
+  pathKey,
+  scrubEnv,
+  type ChildPathResult,
+} from "./env.js";
+import { HOOK_TIMEOUT_MARGIN_SECONDS } from "./hookBridge.js";
 import type { Logger } from "./logger.js";
 import {
   MAX_STDERR_TAIL,
@@ -12,6 +19,17 @@ import {
 } from "./stream.js";
 
 const isWindows = process.platform === "win32";
+
+/**
+ * Полное имя, в которое мост разворачивает алиас `haiku`.
+ *
+ * В режиме плана Claude Code намеренно подменяет алиас `haiku` на Sonnet
+ * («haiku plan upgrade» в CLI 2.1.x): plan_task с model: "haiku" планировал
+ * бы на Sonnet, а стоил бы на порядок дороже, чем просили. Подмена срабатывает
+ * только на сам алиас, полное имя CLI не трогает. Когда выйдет новая Haiku,
+ * это значение нужно обновить вручную.
+ */
+export const HAIKU_FULL_MODEL = "claude-haiku-4-5";
 
 /** Опознавательные поля для записей stream_warn. */
 export interface StreamWarnContext {
@@ -95,21 +113,44 @@ function trimTail(text: string, cap: number): string {
 }
 
 /**
+ * Настройки CLI, которые plan_task передаёт всегда.
+ *
+ * useAutoModeDuringPlan (по умолчанию true): в режиме plan CLI включает
+ * семантику auto-режима, если тот доступен модели, — классификатор сам
+ * одобряет Bash-команды, в том числе пишущие. Для opus он доступен, для haiku
+ * нет: 23.09 plan_task на opus выполнил непрозрачный скрипт, пишущий файл, а на
+ * haiku та же команда получила «This command requires approval». Выключаем:
+ * планирование не место для команд, которые одобряет не человек и не правила.
+ * Настройка из flagSettings (--settings) перекрывает пользовательскую.
+ */
+export const PLAN_MODE_SETTINGS = { useAutoModeDuringPlan: false } as const;
+
+/**
  * Настройки для --settings: PreToolUse-хук на каждый чувствительный инструмент.
  *
  * Отдельная запись на имя, а не regex и не "*": про regex в matcher ничего не
  * подтверждено, а "*" гнал бы через мост вообще все вызовы, включая Read/Grep,
  * — лишний трафик и лишний риск случайного отказа на безобидной операции.
+ *
+ * timeout задаётся явно, а не берётся дефолтный: истёкший таймаут HTTP-хука CLI
+ * трактует как non-blocking error и пропускает вызов. Мост удерживает запрос до
+ * holdSeconds и обязан ответить раньше, чем CLI сдастся, — отсюда запас.
  */
 export function buildHookSettings(
   hookUrl: string,
   tools: string[],
-): { hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ type: string; url: string }> }> } } {
+  holdSeconds: number,
+): {
+  hooks: {
+    PreToolUse: Array<{ matcher: string; hooks: Array<{ type: string; url: string; timeout: number }> }>;
+  };
+} {
+  const timeout = holdSeconds + HOOK_TIMEOUT_MARGIN_SECONDS;
   return {
     hooks: {
       PreToolUse: tools.map((matcher) => ({
         matcher,
-        hooks: [{ type: "http", url: hookUrl }],
+        hooks: [{ type: "http", url: hookUrl, timeout }],
       })),
     },
   };
@@ -157,6 +198,8 @@ export class ClaudeRunner {
   private sandboxSupported = false;
   private version = "unknown";
   private running = 0;
+  /** PATH из реестра для дочернего claude; null — наследуется как есть. */
+  private childPath: string | null = null;
 
   constructor(
     private readonly config: Config,
@@ -182,7 +225,13 @@ export class ClaudeRunner {
    * начал передавать флаг сам, если он появится в будущих версиях.
    */
   probe(): void {
-    const { env } = scrubEnv(process.env, this.config.passEnv);
+    let pathInfo: ChildPathResult | null = null;
+    if (isWindows && this.config.childPathFromRegistry) {
+      pathInfo = buildChildPathFromRegistry();
+      this.childPath = pathInfo.path;
+    }
+
+    const env = this.childEnv();
     const bin = this.config.claudeBin;
 
     // На Windows .cmd/.bat требуют shell:true (Node 20+), а shell — это риск
@@ -235,7 +284,20 @@ export class ClaudeRunner {
       max_concurrent: this.config.maxConcurrent,
       timeout_ms: this.config.timeoutMs,
       config_source: this.config.source,
+      child_path_from_registry: pathInfo ? pathInfo.path !== null : false,
+      child_path_dropped: pathInfo?.dropped ?? [],
+      child_path_error: pathInfo?.error ?? null,
     });
+  }
+
+  /**
+   * Окружение дочернего claude: без ключей Anthropic, с меткой вложенности и, на
+   * Windows, с PATH из реестра.
+   */
+  private childEnv(): NodeJS.ProcessEnv {
+    const { env } = scrubEnv(process.env, this.config.passEnv);
+    if (this.childPath !== null) env[pathKey(env)] = this.childPath;
+    return markNested(env);
   }
 
   /**
@@ -252,8 +314,13 @@ export class ClaudeRunner {
     appendSystemPrompt: string;
     /** Модель для этого вызова. Перекрывает config.model. */
     model?: string | undefined;
-    /** URL HTTP-хука моста разрешений. Без него --settings не передаётся вовсе. */
+    /** URL HTTP-хука моста разрешений. Без него хуков в --settings нет. */
     hookUrl?: string | undefined;
+    /**
+     * Инструменты под хуком. По умолчанию config.sensitiveTools; plan_task
+     * передаёт свой набор (PLAN_SENSITIVE_TOOLS).
+     */
+    hookTools?: string[] | undefined;
     /**
      * Просить у CLI поток событий вместо одного итогового JSON.
      *
@@ -302,12 +369,19 @@ export class ClaudeRunner {
     if (model) args.push("--model", model);
     if (params.sessionId) args.push("--resume", params.sessionId);
     if (this.shouldPassSandbox()) args.push("--sandbox");
+    const settings: Record<string, unknown> = {};
+    if (params.permissionMode === "plan") Object.assign(settings, PLAN_MODE_SETTINGS);
     if (params.hookUrl) {
-      args.push(
-        "--settings",
-        JSON.stringify(buildHookSettings(params.hookUrl, this.config.sensitiveTools)),
+      Object.assign(
+        settings,
+        buildHookSettings(
+          params.hookUrl,
+          params.hookTools ?? this.config.sensitiveTools,
+          this.config.permissionHoldSeconds,
+        ),
       );
     }
+    if (Object.keys(settings).length > 0) args.push("--settings", JSON.stringify(settings));
 
     return args;
   }
@@ -317,9 +391,12 @@ export class ClaudeRunner {
    *
    * Модель вызова перекрывает конфиг, конфиг перекрывает умолчание CLI. Вынесено
    * отдельно, чтобы отчёт и лог показывали ровно то значение, что ушло в argv.
+   *
+   * Алиас `haiku` разворачивается в полное имя — см. HAIKU_FULL_MODEL.
    */
   resolveModel(requested?: string | undefined): string | null {
-    return requested ?? this.config.model ?? null;
+    const model = requested ?? this.config.model ?? null;
+    return model === "haiku" ? HAIKU_FULL_MODEL : model;
   }
 
   /** Нужно ли добавлять --sandbox с учётом конфига и реальной поддержки CLI. */
@@ -337,7 +414,7 @@ export class ClaudeRunner {
       );
     }
 
-    const { env } = scrubEnv(process.env, this.config.passEnv);
+    const env = this.childEnv();
     const startedAt = Date.now();
 
     const child = spawn(this.config.claudeBin, options.args, {

@@ -25,7 +25,7 @@ export interface Job {
   /** Разрешается при завершении задачи; используется для ожидания с таймаутом. */
   completion: Promise<void>;
   /**
-   * Мост HTTP-хуков этой задачи. null — хуки выключены или это plan_task.
+   * Мост HTTP-хуков этой задачи. null — хуки выключены (hooksEnabled: false).
    *
    * После завершения задачи перестаёт слушать порт, но карту запросов хранит:
    * get_task_status показывает историю разрешений и по завершённой задаче.
@@ -43,6 +43,9 @@ export interface Job {
 }
 
 const MAX_FINISHED = 100;
+
+/** Сессию уже продолжает другая задача: второй прогон запрещён. */
+export class SessionBusyError extends Error {}
 
 export class JobRegistry {
   private readonly jobs = new Map<string, Job>();
@@ -70,6 +73,29 @@ export class JobRegistry {
 
   get(processId: string): Job | undefined {
     return this.jobs.get(processId);
+  }
+
+  /**
+   * Идущая задача, которая пишет в сессию sessionId.
+   *
+   * Источников session_id у задачи три, и проверяются все: запрошенный на входе
+   * (--resume, известен сразу), из строки init потока (через секунду после
+   * спавна — так занята и сессия, которую задача только что создала) и из
+   * итоговой строки result. Два прогона одной сессии пишут в один транскрипт
+   * и перемешивают ходы — 23.09 так шли параллельно два plan_task по f5338b1d.
+   */
+  findRunningBySession(sessionId: string): Job | undefined {
+    for (const job of this.jobs.values()) {
+      if (job.status !== "running") continue;
+      if (
+        job.requestedSessionId === sessionId ||
+        job.progress.snapshot().sessionId === sessionId ||
+        job.result?.sessionId === sessionId
+      ) {
+        return job;
+      }
+    }
+    return undefined;
   }
 
   complete(job: Job, status: JobStatus, result: ParsedResult | null, exitCode: number | null): void {

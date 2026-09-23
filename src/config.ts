@@ -35,6 +35,15 @@ export const ConfigSchema = z.object({
   sandbox: z.enum(["auto", "on", "off"]).default("auto"),
   /** Имена переменных окружения, которые пропускаем несмотря на чистку. */
   passEnv: z.array(z.string().min(1)).default([]),
+  /**
+   * Только Windows: собирать PATH дочернего claude заново из реестра (HKLM + HKCU),
+   * а не наследовать от родителя.
+   *
+   * Claude Desktop отдаёт серверу PATH со своими добавками. Каталог MSIX-пакета
+   * PowerShell 7 при этом сохраняется и ставится первым — см. keepPwshPackageDir
+   * в env.ts. На других ОС ни на что не влияет.
+   */
+  childPathFromRegistry: z.boolean().default(true),
   /** Файл JSONL-лога. */
   logFile: z.string().min(1).default("./logs/ccc-mcp.jsonl"),
   /** Сколько символов текста задачи попадает в лог. */
@@ -110,12 +119,13 @@ export const ConfigSchema = z.object({
   /**
    * Контроль чувствительных операций дочернего CLI через PreToolUse-хуки.
    *
-   * Механизм опирается на то, что модель повторит отклонённый вызов после
-   * одобрения. Вручную проверено на macOS + CLI 2.1.268: повтор побайтовый,
-   * окончательный deny прекращает попытки.
+   * Основной путь — удержание вызова до решения оператора (permissionHoldSeconds),
+   * от поведения модели он не зависит. Запасной путь после истёкшего удержания
+   * опирается на то, что модель повторит вызов. Вручную проверено на macOS + CLI
+   * 2.1.268 и Windows + CLI 2.1.274.
    *
-   * Дефолт всё равно false — он распространяется и на непроверенные платформы
-   * (Windows), а включается опт-ин дешёвым: поле в конфиге либо
+   * Дефолт всё равно false: мост начинает перехватывать команды дочернего CLI
+   * только по явному решению оператора. Включается дёшево — поле в конфиге либо
    * CCC_HOOKS_ENABLED=1.
    */
   hooksEnabled: z.boolean().default(false),
@@ -129,6 +139,17 @@ export const ConfigSchema = z.object({
    * могла бы «продавить» любое разрешение, просто продолжая пытаться.
    */
   retryBudget: z.number().int().min(1).max(100).default(10),
+  /**
+   * Сколько секунд держать вызов, ждущий одобрения, прежде чем ответить отказом
+   * с просьбой повторить. 0 — отказывать сразу, как до появления удержания.
+   *
+   * Пока вызов удержан, дочерний CLI просто ждёт, и после одобрения операция
+   * проходит с первой попытки: модели не нужно ни верить тексту отказа, ни
+   * повторять вызов. Верхняя граница — с запасом до таймаута хука, который мост
+   * выставляет сам (удержание + HOOK_TIMEOUT_MARGIN_SECONDS): истёкший таймаут
+   * CLI трактует как разрешение.
+   */
+  permissionHoldSeconds: z.number().int().min(0).max(900).default(120),
   /** Предел числа различных запросов на разрешение в одной задаче. */
   maxPendingRequests: z.number().int().min(1).max(500).default(50),
   /**
@@ -155,6 +176,16 @@ export const ConfigSchema = z.object({
    * процессы claude, то есть жжёт токены.
    */
   autoApproveCommands: z.array(z.string().min(1)).default([]),
+  /**
+   * То же для plan_task: отдельный список, с autoApproveCommands не смешивается.
+   *
+   * При hooksEnabled каждая Bash-команда планирования уходит оператору, потому
+   * что plan-режим CLI Bash не изолирует: правила permissions.allow (например
+   * «Bash(python3 *)», «Bash(docker compose *)») действуют и в нём. Список
+   * отдельный, потому что годное для выполнения («npm run build» пишет dist/)
+   * не обязательно годится для разведки. Сравнение то же — строка целиком.
+   */
+  planAutoApproveCommands: z.array(z.string().min(1)).default([]),
 });
 
 export type RawConfig = z.infer<typeof ConfigSchema>;
@@ -246,6 +277,17 @@ function applyEnvOverrides(input: Record<string, unknown>): Record<string, unkno
     if (v === "1" || v === "true") out["streamEvents"] = true;
     else if (v === "0" || v === "false") out["streamEvents"] = false;
     else throw new ConfigError(`CCC_STREAM_EVENTS должен быть 1/0/true/false, получено: ${stream}`);
+  }
+
+  const childPath = process.env["CCC_CHILD_PATH_FROM_REGISTRY"];
+  if (childPath && childPath.trim()) {
+    const v = childPath.trim().toLowerCase();
+    if (v === "1" || v === "true") out["childPathFromRegistry"] = true;
+    else if (v === "0" || v === "false") out["childPathFromRegistry"] = false;
+    else
+      throw new ConfigError(
+        `CCC_CHILD_PATH_FROM_REGISTRY должен быть 1/0/true/false, получено: ${childPath}`,
+      );
   }
 
   return out;

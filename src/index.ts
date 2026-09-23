@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 
 import { ConfigError, loadConfig, type Config } from "./config.js";
+import { isNested, NESTED_ENV_VAR } from "./env.js";
 import { diagnose, type Diagnosis } from "./diagnose.js";
 import { listProjectFiles, normalizeExtensions } from "./fileList.js";
 import { FileOpError, readProjectFile, writeProjectFile } from "./fileOps.js";
@@ -15,7 +16,14 @@ import {
   type PermissionRequest,
   type RequestDecision,
 } from "./hookBridge.js";
-import { JobRegistry, waitForJob, type Job, type JobStatus, type WaitReason } from "./jobs.js";
+import {
+  JobRegistry,
+  SessionBusyError,
+  waitForJob,
+  type Job,
+  type JobStatus,
+  type WaitReason,
+} from "./jobs.js";
 import { Logger, preview } from "./logger.js";
 import { parseClaudeOutput, type ParsedResult } from "./parser.js";
 import { ProjectDirError, ProjectFileError, validateProjectDir } from "./paths.js";
@@ -39,6 +47,17 @@ import {
 const PERMISSION_MODES = ["acceptEdits", "bypassPermissions"] as const;
 
 /**
+ * Инструменты под хуком в plan_task — независимо от sensitiveTools.
+ *
+ * Правку файлов plan-режим CLI и так запрещает (кроме файла плана), а вот
+ * запуск команд — нет: Bash и Monitor исполняют произвольный shell, и правила
+ * permissions.allow пользователя пропускают их без вопросов. 23.09 так прошли
+ * docker compose down/up, запись в redis и перезапись двух файлов через
+ * python3 -c — всё внутри plan_task.
+ */
+const PLAN_SENSITIVE_TOOLS = ["Bash", "Monitor"];
+
+/**
  * Версия берётся из package.json на старте, а не дублируется строкой: иначе bump
  * версии при публикации разъедется с тем, что сервер объявляет клиенту.
  * Путь общий для src/index.ts и dist/index.js — rootDir "src" даёт плоский dist,
@@ -56,7 +75,7 @@ interface PermissionRequestView {
   tool_name: string;
   summary: string;
   decision: RequestDecision;
-  /** Сколько раз модель уже пыталась выполнить эту операцию. */
+  /** Сколько раз хук ответил отказом. Вызов, одобренный во время удержания, отказом не считается. */
   denied_count: number;
   allowed_count: number;
   first_seen_at: string;
@@ -295,7 +314,132 @@ function errorResult(message: string) {
   };
 }
 
+/**
+ * Синоним session_id во входах plan_task, approve_plan и execute_task.
+ *
+ * Прокси remote-devices в Cowork вырезает из аргументов ключ session_id до
+ * пересылки локальному stdio-серверу: approve_plan приходил с одним
+ * plan_digest (см. BUGREPORT-approve_plan-session_id-undefined.md). Второе
+ * имя — обход этой платформенной ошибки на нашей стороне, а не её исправление.
+ * session_id работает как прежде.
+ */
+const SESSION_ALIAS = "session";
+
+/**
+ * Схема входа с парой session_id / session.
+ *
+ * На уровне полей оба необязательны, а правила «хотя бы одно» (для required)
+ * и «не расходятся» проверяет superRefine. Так отказ по-прежнему отдаёт SDK
+ * как -32602 до хендлера — с той же формой сообщения и записью invalid_args,
+ * — а хендлер получает уже согласованную пару и берёт её через sessionIdOf.
+ */
+function withSessionId<Shape extends z.ZodRawShape>(
+  shape: Shape,
+  opts: { required: boolean; description: string },
+) {
+  const field = z.string().min(1).optional();
+  return z
+    .object({
+      ...shape,
+      session_id: field.describe(opts.description),
+      [SESSION_ALIAS]: field.describe(
+        `Синоним session_id с тем же значением — для клиентов, чей прокси теряет ключ ` +
+          `session_id. Передавайте одно из двух; если переданы оба, они должны совпадать.`,
+      ),
+    } as Shape & { session_id: typeof field; session: typeof field })
+    .superRefine((args, ctx) => {
+      const { session_id: id, session: alias } = args as { session_id?: string; session?: string };
+      if (id !== undefined && alias !== undefined && id !== alias) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["session_id"],
+          message: `session_id и ${SESSION_ALIAS} переданы с разными значениями — передайте одно из двух`,
+        });
+      } else if (opts.required && id === undefined && alias === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["session_id"],
+          message:
+            `Invalid input: expected string, received undefined ` +
+            `(передайте session_id или его синоним ${SESSION_ALIAS})`,
+        });
+      }
+    });
+}
+
+/** session_id из пары session_id / session, уже согласованной withSessionId. */
+function sessionIdOf(args: { session_id?: string | undefined; session?: string | undefined }) {
+  return args.session_id ?? args.session;
+}
+
+/** Каким именем пришёл session_id — для лога: так видно, сработал ли обход. */
+function sessionParamOf(args: { session_id?: string | undefined; session?: string | undefined }) {
+  if (args.session_id !== undefined) return "session_id";
+  return args.session !== undefined ? SESSION_ALIAS : null;
+}
+
+/** Тип значения для лога: typeof, но массив и null различимы. */
+function argKind(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/**
+ * Пишет в лог вызовы, отбитые проверкой inputSchema.
+ *
+ * SDK проверяет аргументы до хендлера и сам отвечает клиенту -32602, так что
+ * без этой обёртки такой вызов не оставляет в логе ничего и выглядит так,
+ * будто до процесса не дошёл (см. историю с прокси, терявшим session_id).
+ * Пишутся только имена полученных ключей и типы значений: через аргументы
+ * текут task_text и тела файлов, их место — не здесь.
+ *
+ * validateToolInput — приватный метод McpServer, публичного хука перед
+ * валидацией у SDK нет. Если после обновления SDK метода не окажется,
+ * обёртка отключается с предупреждением в stderr, а сервер работает как был.
+ */
+function logInvalidArgs(server: McpServer, logger: Logger): void {
+  const target = server as unknown as {
+    validateToolInput?: (tool: unknown, args: unknown, toolName: string) => Promise<unknown>;
+  };
+  const original = target.validateToolInput;
+  if (typeof original !== "function") {
+    logger.stderr("validateToolInput не найден в SDK: вызовы с невалидными аргументами не логируются");
+    return;
+  }
+  target.validateToolInput = async function (tool, args, toolName) {
+    try {
+      return await original.call(this, tool, args, toolName);
+    } catch (err) {
+      const received =
+        args !== null && typeof args === "object"
+          ? Object.fromEntries(Object.entries(args).map(([k, v]) => [k, argKind(v)]))
+          : argKind(args);
+      logger.write({
+        event: "invalid_args",
+        tool: toolName,
+        received,
+        message: preview(err instanceof Error ? err.message : String(err), 500),
+      });
+      throw err;
+    }
+  };
+}
+
 async function main(): Promise<void> {
+  // До загрузки конфига и пробы claude: вложенному мосту не нужно ни то, ни
+  // другое, а проба сама порождала бы процесс claude. Код выхода ненулевой, чтобы
+  // дочерний CLI показал сервер как упавший с этой причиной, а не как пустой.
+  if (isNested()) {
+    process.stderr.write(
+      `[ccc-mcp] запущен внутри дочернего Claude Code моста (${NESTED_ENV_VAR}) — ` +
+        `вложенный мост отключён: он дал бы дочернему процессу запуск новых claude ` +
+        `и git/запись файлов мимо контроля разрешений.\n`,
+    );
+    process.exit(1);
+    return;
+  }
+
   let config: Config;
   try {
     config = loadConfig();
@@ -350,9 +494,15 @@ async function main(): Promise<void> {
     {
       instructions:
         "Мост к локальной установке Claude Code. Действует обязательный протокол из трёх шагов: " +
-        "1) plan_task — получить план, файлы не изменяются; " +
+        "1) plan_task — получить план. Это разведка, а не песочница: правку файлов режим плана " +
+        "запрещает, но Bash-команды выполняются по правилам разрешений пользователя, поэтому при " +
+        "включённом контроле разрешений они, как и в execute_task, ждут решения оператора; " +
+        "не отправляйте в plan_task задачу «выполни» — только «спланируй»; " +
         "2) показать план пользователю и, получив согласие, вызвать approve_plan с session_id и plan_digest из ответа plan_task; " +
         "3) execute_task с тем же session_id — выполнение. " +
+        "Во всех трёх инструментах session_id можно передать и под синонимом session (одно из двух " +
+        "имён; если переданы оба, значения должны совпадать) — это обход для клиентов, чей прокси " +
+        "теряет ключ session_id. " +
         "execute_task без одобренного плана всегда отклоняется, запустить его «с нуля» нельзя. " +
         "Повторный plan_task сбрасывает одобрение. После успешного выполнения нужен новый цикл. " +
         "Интерактивные вопросы недоступны: если Claude Code не хватило информации, ответ содержит " +
@@ -389,6 +539,42 @@ async function main(): Promise<void> {
         "Для правок кода по-прежнему нужен полный протокол.",
     },
   );
+  logInvalidArgs(server, logger);
+
+  /**
+   * Сессии, по которым задача уже запускается, но Job ещё не создан.
+   *
+   * Между проверкой занятости и jobs.create в startTask есть await (подъём моста
+   * хуков, спавн), и без этой брони второй вызов с тем же session_id прошёл бы
+   * проверку в этом окне.
+   */
+  const startingSessions = new Set<string>();
+
+  /**
+   * Отказ, если сессию уже продолжает идущая задача или она сейчас запускается.
+   *
+   * Синхронная: вызывается до первого await в startTask, поэтому проверка и
+   * бронь неделимы. Для execute_task вызывается ещё и до beginExecution, чтобы
+   * отказ не трогал состояние одобрения.
+   */
+  function assertSessionIdle(sessionId: string): void {
+    const running = jobs.findRunningBySession(sessionId);
+    if (running) {
+      const seconds = Math.round((Date.now() - running.startedAt) / 1000);
+      throw new SessionBusyError(
+        `сессию ${sessionId} уже продолжает задача ${running.processId} (${running.tool}, ` +
+          `идёт ${seconds} с). Два прогона одной сессии пишут в один транскрипт и перемешивают ` +
+          `ходы, поэтому второй не запускается. Дождитесь её завершения через get_task_status ` +
+          `с process_id "${running.processId}" или остановите её cancel_task, затем повторите вызов.`,
+      );
+    }
+    if (startingSessions.has(sessionId)) {
+      throw new SessionBusyError(
+        `по сессии ${sessionId} прямо сейчас запускается другая задача. Повторите вызов через ` +
+          `несколько секунд: к тому времени у неё будет process_id для get_task_status.`,
+      );
+    }
+  }
 
   /** Общий запуск задачи для plan_task и execute_task. */
   async function startTask(params: {
@@ -402,23 +588,43 @@ async function main(): Promise<void> {
   }) {
     const cwd = validateProjectDir(params.projectDir, config.resolvedRoots);
 
+    // До первого await: проверка и бронь неделимы (см. startingSessions).
+    const resumeId = params.sessionId;
+    if (resumeId !== undefined) {
+      assertSessionIdle(resumeId);
+      startingSessions.add(resumeId);
+    }
+    try {
+      return await spawnTask(params, cwd);
+    } finally {
+      // К этому моменту Job либо создан (и дальше сессию держит он), либо запуск
+      // не удался — в обоих случаях бронь больше не нужна.
+      if (resumeId !== undefined) startingSessions.delete(resumeId);
+    }
+  }
+
+  /** Тело startTask после проверки каталога и брони сессии. */
+  async function spawnTask(params: Parameters<typeof startTask>[0], cwd: string) {
     // Разрешаем один раз: это же значение уходит в argv, отчёт и лог.
     const model = runner.resolveModel(params.model);
 
     // Мост поднимаем ДО спавна: порт выдаёт ОС, а он нужен уже в --settings.
-    // Только для execute_task: в plan-режиме модель не меняет файлы, а Bash там
-    // нужен для разведки — блокировать его значит сломать планирование.
-    const bridge =
-      params.tool === "execute_task" && config.hooksEnabled
-        ? await HookBridge.start({
-            sensitiveTools: config.sensitiveTools,
-            retryBudget: config.retryBudget,
-            maxPendingRequests: config.maxPendingRequests,
-            allowWaitCommand: config.allowWaitCommand,
-            autoApproveCommands: config.autoApproveCommands,
-            logger,
-          })
-        : null;
+    // И для plan_task тоже: plan-режим CLI не изолирует Bash (см.
+    // PLAN_SENSITIVE_TOOLS), так что команды разведки идут оператору, кроме
+    // своего списка planAutoApproveCommands.
+    const isPlan = params.tool === "plan_task";
+    const hookTools = isPlan ? PLAN_SENSITIVE_TOOLS : config.sensitiveTools;
+    const bridge = config.hooksEnabled
+      ? await HookBridge.start({
+          sensitiveTools: hookTools,
+          retryBudget: config.retryBudget,
+          maxPendingRequests: config.maxPendingRequests,
+          allowWaitCommand: config.allowWaitCommand,
+          autoApproveCommands: isPlan ? config.planAutoApproveCommands : config.autoApproveCommands,
+          holdMs: config.permissionHoldSeconds * 1000,
+          logger,
+        })
+      : null;
 
     const args = runner.buildTaskArgs({
       permissionMode: params.permissionMode,
@@ -428,6 +634,7 @@ async function main(): Promise<void> {
       appendSystemPrompt:
         params.tool === "plan_task" ? PLAN_SYSTEM_PROMPT : EXECUTE_SYSTEM_PROMPT,
       hookUrl: bridge?.url,
+      hookTools,
       stream: config.streamEvents,
     });
 
@@ -534,7 +741,7 @@ async function main(): Promise<void> {
       resume_session_id: job.requestedSessionId,
       sandbox: runner.shouldPassSandbox(),
       hooks: bridge !== null,
-      sensitive_tools: bridge ? config.sensitiveTools : null,
+      sensitive_tools: bridge ? hookTools : null,
       task_preview: job.taskPreview,
       pid: handle.pid,
     });
@@ -648,6 +855,7 @@ async function main(): Promise<void> {
   function describeError(err: unknown): string {
     if (err instanceof ApprovalError) return `Отказано: ${err.message}`;
     if (err instanceof ProjectDirError) return `Отказано: ${err.message}`;
+    if (err instanceof SessionBusyError) return `Отказано: ${err.message}`;
     if (err instanceof ProjectFileError) return `Отказано: ${err.message}`;
     if (err instanceof PermissionRequestError) return `Отказано: ${err.message}`;
     // Операционные отказы файловых тулов — это не политика, префикс тут врал бы.
@@ -701,24 +909,33 @@ async function main(): Promise<void> {
       title: "Спланировать задачу",
       description:
         "Запускает Claude Code в режиме планирования (--permission-mode plan): он изучает проект " +
-        "и возвращает план, не изменяя файлы. Интерактивные вопросы в этом режиме запрещены: " +
+        "и возвращает план. Это не песочница: режим плана запрещает правку файлов, но не запуск " +
+        "команд — Bash выполняется по правилам разрешений пользователя (permissions.allow). " +
+        "Поэтому при включённом контроле разрешений (hooksEnabled) каждая Bash-команда, кроме " +
+        "списка planAutoApproveCommands, ждёт решения оператора: опрашивайте get_task_status и " +
+        "проводите permission_requests через approve_permission_request, как для execute_task. " +
+        "Задачу «выполни» сюда не отправляйте: план строится, работа не делается. " +
+        "Интерактивные вопросы в этом режиме запрещены: " +
         "если информации не хватает, план придёт с разделом «Открытые вопросы» и полем " +
         "has_open_questions: true. Такой план одобрить нельзя — уточните вопросы у пользователя " +
-        "и вызовите plan_task заново. Иначе покажите план пользователю и вызовите approve_plan.",
-      inputSchema: {
-        task_text: z.string().min(1).describe("Текст задачи для Claude Code."),
-        project_dir: z
-          .string()
-          .min(1)
-          .describe("Абсолютный путь к каталогу проекта. Должен быть внутри белого списка сервера."),
-        session_id: z
-          .string()
-          .min(1)
-          .optional()
-          .describe("Продолжить существующую сессию Claude Code вместо новой."),
-        model: modelSchema,
-        wait_seconds: waitSecondsSchema,
-      },
+        "и вызовите plan_task заново. Иначе покажите план пользователю и вызовите approve_plan. " +
+        "Чтобы продолжить существующую сессию, передайте её id в session_id или в синониме session.",
+      inputSchema: withSessionId(
+        {
+          task_text: z.string().min(1).describe("Текст задачи для Claude Code."),
+          project_dir: z
+            .string()
+            .min(1)
+            .describe("Абсолютный путь к каталогу проекта. Должен быть внутри белого списка сервера."),
+          model: modelSchema,
+          wait_seconds: waitSecondsSchema,
+        },
+        {
+          required: false,
+          description:
+            "Продолжить существующую сессию Claude Code вместо новой. Можно передать и как session.",
+        },
+      ),
     },
     async (args) => {
       try {
@@ -726,14 +943,19 @@ async function main(): Promise<void> {
           tool: "plan_task",
           taskText: args.task_text,
           projectDir: args.project_dir,
-          sessionId: args.session_id,
+          sessionId: sessionIdOf(args),
           permissionMode: "plan",
           model: args.model,
           waitSeconds: args.wait_seconds ?? config.defaultWaitSeconds,
         });
       } catch (err) {
         const message = describeError(err);
-        logger.write({ event: "error", tool: "plan_task", message });
+        logger.write({
+          event: err instanceof SessionBusyError ? "denied" : "error",
+          tool: "plan_task",
+          session_id: sessionIdOf(args) ?? null,
+          message,
+        });
         return errorResult(message);
       }
     },
@@ -746,43 +968,52 @@ async function main(): Promise<void> {
       description:
         "Запускает Claude Code на выполнение задачи и возвращает итоговый отчёт: что сделано, " +
         "какие файлы изменены, какие были ошибки. ВАЖНО: выполняется только по одобренному плану. " +
-        "session_id обязателен, и сессия должна быть предварительно проведена через plan_task " +
+        "session_id обязателен (его можно передать и как синоним session), и сессия должна быть " +
+        "предварительно проведена через plan_task " +
         "и approve_plan — иначе вызов отклоняется. Запустить задачу «с нуля», минуя план, нельзя. " +
         "model можно указать отличную от той, которой строился план: одобрение привязано к тексту " +
         "плана и каталогу, а не к модели.",
-      inputSchema: {
-        task_text: z.string().min(1).describe("Текст задачи для Claude Code."),
-        project_dir: z
-          .string()
-          .min(1)
-          .describe("Абсолютный путь к каталогу проекта. Должен совпадать с тем, для которого строился план."),
-        session_id: z
-          .string()
-          .min(1)
-          .describe("Обязателен. session_id одобренной сессии, полученный из plan_task."),
-        permission_mode: z
-          .enum(PERMISSION_MODES)
-          .optional()
-          .describe(
-            "acceptEdits — принимать правки файлов (по умолчанию). bypassPermissions — не спрашивать вообще, включая запуск команд.",
-          ),
-        model: modelSchema,
-        wait_seconds: waitSecondsSchema,
-      },
+      inputSchema: withSessionId(
+        {
+          task_text: z.string().min(1).describe("Текст задачи для Claude Code."),
+          project_dir: z
+            .string()
+            .min(1)
+            .describe("Абсолютный путь к каталогу проекта. Должен совпадать с тем, для которого строился план."),
+          permission_mode: z
+            .enum(PERMISSION_MODES)
+            .optional()
+            .describe(
+              "acceptEdits — принимать правки файлов (по умолчанию). bypassPermissions — не спрашивать вообще, включая запуск команд.",
+            ),
+          model: modelSchema,
+          wait_seconds: waitSecondsSchema,
+        },
+        {
+          required: true,
+          description:
+            "Обязателен (либо он, либо синоним session). session_id одобренной сессии, полученный из plan_task.",
+        },
+      ),
     },
     async (args) => {
+      // Схема уже потребовала одно из двух имён; ?? "" нужен только типам.
+      const sessionId = sessionIdOf(args) ?? "";
       try {
         // Путь канонизируем до проверки допуска: одобрение привязано к
         // каталогу, для которого строился план.
         const cwd = validateProjectDir(args.project_dir, config.resolvedRoots);
-        sessions.beginExecution(args.session_id, cwd);
+        // До beginExecution: отказ по занятости не должен трогать одобрение.
+        // Та же проверка повторится в startTask — уже вместе с бронью.
+        assertSessionIdle(sessionId);
+        sessions.beginExecution(sessionId, cwd);
 
         try {
           return await startTask({
             tool: "execute_task",
             taskText: args.task_text,
             projectDir: cwd,
-            sessionId: args.session_id,
+            sessionId,
             permissionMode: args.permission_mode ?? "acceptEdits",
             model: args.model,
             waitSeconds: args.wait_seconds ?? config.defaultWaitSeconds,
@@ -790,16 +1021,20 @@ async function main(): Promise<void> {
         } catch (err) {
           // Процесс не стартовал — возвращаем занятое одобрение, иначе сессия
           // осталась бы в состоянии executing навсегда.
-          sessions.finishExecution(args.session_id, false);
+          sessions.finishExecution(sessionId, false);
           throw err;
         }
       } catch (err) {
         const message = describeError(err);
-        const denied = err instanceof ApprovalError || err instanceof ProjectDirError;
+        const denied =
+          err instanceof ApprovalError ||
+          err instanceof ProjectDirError ||
+          err instanceof SessionBusyError;
         logger.write({
           event: denied ? "denied" : "error",
           tool: "execute_task",
-          session_id: args.session_id,
+          session_id: sessionId,
+          session_param: sessionParamOf(args),
           project_dir: args.project_dir,
           message,
         });
@@ -817,22 +1052,31 @@ async function main(): Promise<void> {
         "после чего становится доступен execute_task. Вызывайте только после того, как план " +
         "из plan_task показан пользователю и получено согласие (либо план сверен с паспортом " +
         "проекта). plan_digest берётся из ответа plan_task и передаётся без изменений — так " +
-        "нельзя одобрить план вслепую или по угаданному session_id.",
-      inputSchema: {
-        session_id: z.string().min(1).describe("session_id из ответа plan_task."),
-        plan_digest: z
-          .string()
-          .min(1)
-          .describe("Значение plan_digest из ответа plan_task, без изменений."),
-      },
+        "нельзя одобрить план вслепую или по угаданному session_id. session_id можно передать " +
+        "и как синоним session.",
+      inputSchema: withSessionId(
+        {
+          plan_digest: z
+            .string()
+            .min(1)
+            .describe("Значение plan_digest из ответа plan_task, без изменений."),
+        },
+        {
+          required: true,
+          description: "session_id из ответа plan_task (либо он, либо синоним session).",
+        },
+      ),
     },
     async (args) => {
+      // Схема уже потребовала одно из двух имён; ?? "" нужен только типам.
+      const sessionId = sessionIdOf(args) ?? "";
       try {
-        const record = sessions.approve(args.session_id, args.plan_digest);
+        const record = sessions.approve(sessionId, args.plan_digest);
 
         logger.write({
           event: "approve",
           session_id: record.sessionId,
+          session_param: sessionParamOf(args),
           project_dir: record.projectDir,
           plan_digest: record.planDigest,
           session_state: record.state,
@@ -861,7 +1105,8 @@ async function main(): Promise<void> {
         logger.write({
           event: err instanceof ApprovalError ? "denied" : "error",
           tool: "approve_plan",
-          session_id: args.session_id,
+          session_id: sessionId,
+          session_param: sessionParamOf(args),
           message,
         });
         return errorResult(message);
@@ -879,9 +1124,14 @@ async function main(): Promise<void> {
         "permission_requests ответа get_task_status, пока задача выполняется. Вызывайте только " +
         "после того, как запрос показан пользователю и получено его согласие. request_id — " +
         "отпечаток самого вызова, его нельзя угадать, не увидев запрос в get_task_status. " +
-        "После allow дочерний процесс повторит вызов сам; после deny — прекратит попытки.",
+        "Если вызов в этот момент удерживается мостом (permissionHoldSeconds), решение сразу " +
+        "отвечает ему: после allow операция проходит с этой же попытки. Если удержание уже " +
+        "истекло, после allow дочерний процесс повторит вызов сам; после deny — прекратит попытки.",
       inputSchema: {
-        process_id: z.string().min(1).describe("Идентификатор задачи, выданный execute_task."),
+        process_id: z
+          .string()
+          .min(1)
+          .describe("Идентификатор задачи, выданный plan_task или execute_task."),
         request_id: z
           .string()
           .min(1)
@@ -910,7 +1160,7 @@ async function main(): Promise<void> {
         if (!job.bridge) {
           return errorResult(
             `Для задачи ${args.process_id} контроль разрешений не включён ` +
-              `(hooksEnabled: false либо это plan_task). Решать нечего.`,
+              `(hooksEnabled: false). Решать нечего.`,
           );
         }
         // Гонка: задача могла закончиться между отказом хука и одобрением.
@@ -945,7 +1195,8 @@ async function main(): Promise<void> {
             record.resolvedAt !== null ? new Date(record.resolvedAt).toISOString() : null,
           next_step:
             record.decision === "approved"
-              ? `Решение записано. Дочерний Claude Code повторит вызов сам — следите за ходом через ` +
+              ? `Решение записано. Удерживаемый вызов пропущен сразу, а если удержание уже истекло, ` +
+                `дочерний Claude Code повторит вызов сам. Следите за ходом через ` +
                 `get_task_status с process_id "${job.processId}".`
               : `Отказ записан. Дочерний Claude Code получит указание прекратить попытки и ` +
                 `продолжить без этой операции. Следите за ходом через get_task_status.`,

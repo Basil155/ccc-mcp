@@ -7,10 +7,12 @@
 | `Not logged in · Please run /login` | Выполните `claude auth login`. |
 | `401 Invalid API key` | В окружение просочился ключ родителя — проверьте `passEnv`, там не должно быть `ANTHROPIC_API_KEY`. |
 | `project_dir вне белого списка` | Добавьте путь в `allowedRoots`. В JSON слэши экранируются: `"D:\\Projects"`. |
-| `не удалось запустить "claude"` | Claude Code нет в PATH — укажите полный путь в `claudeBin`. |
+| `не удалось запустить "claude"` / `spawnSync claude ENOENT` | Claude Code не виден `spawn` — укажите полный путь в `claudeBin`. На Windows при npm-установке это норма: в `PATH` лежат только `claude.cmd`/`.ps1`, а мост запускается с `shell: false`. Переставлять CLI не нужно, нативный бинарь есть внутри пакета: `%APPDATA%\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe`. |
+| Windows: в Bash дочернего Claude Code `ls`/`tail`/`git`/`dotnet: command not found`, а `echo "$PATH"` показывает Windows-формат (`C:\…;C:\…`) | Снимок шелла Claude Code (`~/.claude/shell-snapshots`) сохранил PATH в Windows-формате, без `/usr/bin`: в строке `export PATH=` стоит `C:\…`. CLI получает POSIX-вид PATH пробой `bash -lc 'echo "$PATH"'` с таймаутом 10 с, а если проба не удалась, молча пишет в снимок Windows-PATH. На CLI 2.1.274 это случается непостоянно и без моста, в любой сессии Claude Code. Причина не установлена: ни пересборка PATH, ни `HOME`, ни `~/.bashrc` не объясняют её однозначно. Снимок создаётся заново в каждой новой сессии, поэтому следующий запуск может пройти. |
+| Windows: PowerShell в дочернем Claude Code отклоняет любую команду: `Command contains malformed syntax that cannot be parsed: pwsh exited with code 1` с нечитаемым текстом («Слишком длинная командная строка» в cp866) | Claude Code нашёл только алиас `%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`, а разбор синтаксиса через него падает. Так бывает, когда PowerShell 7 стоит из Microsoft Store: его каталог в PATH реестра не попадает. Мост при `childPathFromRegistry: true` берёт каталог `WindowsApps\Microsoft.PowerShell_*` из своего PATH и ставит его первым. Если в `startup` лога этот каталог числится в `child_path_dropped`, значит мост старый или сам получил PATH без него. Надёжнее всего поставить PowerShell 7 MSI-пакетом в `C:\Program Files\PowerShell\7`. |
 | `404 … Модель недоступна или не существует` | Опечатка в параметре `model` вызова либо в поле `model` конфига, или у аккаунта нет доступа к этой модели. |
 | `недопустимое имя модели` | Значение `model` не прошло проверку схемы: допустимы буквы, цифры и `. _ : - [ ]`, начинаться должно с буквы или цифры. |
-| `claudeBin указывает на .cmd-обёртку` | Укажите `.exe`, например `C:\Users\<имя>\.local\bin\claude.exe`. |
+| `claudeBin указывает на .cmd-обёртку` | Укажите `.exe`. Нативная установка — `C:\Users\<имя>\.local\bin\claude.exe`, npm-установка — путь из строки выше. |
 | `достигнут предел одновременных задач` | Дождитесь задач или увеличьте `maxConcurrent`. |
 | Задача не найдена в `get_task_status` | Сервер перезапускался либо истёк `jobRetentionMs`. История — в логе. |
 | `status: "timeout"` | Увеличьте `timeoutMs`. |
@@ -43,6 +45,14 @@
 | `403 … does not support model …` | Модель из `~/.claude/settings.json` недоступна headless-режиму — задайте рабочую в `model`. |
 | `Credit balance is too low` | CLI авторизован аккаунтом без подписки. Проверьте `claude auth status` (поле `subscriptionType`) и перелогиньтесь. |
 | `progress.bad_lines > 0`, а `result_text` пуст | Формат `stream-json` дочернего CLI разошёлся с ожиданиями моста. `hint` в этом случае уже говорит об этом прямо. Обход — `streamEvents: false` в конфиге: мост попросит у CLI один итоговый JSON вместо потока. |
+
+## Сборка и установка
+
+| Симптом | Что делать |
+|---|---|
+| Десятки `TS2339: Property '…' does not exist on type 'Config'` при чистом `config.ts`, либо `Cannot find module './v4/classic/external.cjs'` | Битая установка `zod`: пакет на месте, но каталога `node_modules/zod/v4` нет. Все точки входа ссылаются на него, поэтому `z.infer` схлопывает `Config` в пустой тип — ломаются и типы, и рантайм. `npm install` молча отвечает «up to date»: содержимое пакетов он не проверяет. Лечится `rm -rf node_modules/zod && npm install`. |
+| `claude mcp add` → `error: missing required argument 'commandOrUrl'` | Команда запущена из PowerShell: он перехватывает `--` и не передаёт его дальше. `--%` тоже не помогает (`unknown option '--%'`). Регистрируйте сервер из `cmd.exe`, Git Bash или WSL. |
+| `-32602 Input validation error … received undefined at <ключ>`, хотя ключ передан | Проверьте записи `invalid_args` в логе. Если запись есть и в `received` нужного ключа нет, запрос дошёл до сервера уже без него: ключ потерялся между клиентом и мостом, скорее всего в прокси. Если записи нет, вызов до этого процесса действительно не дошёл. Если потерялся `session_id` (так делает прокси `remote-devices` в Cowork), передайте то же значение под синонимом `session`. |
 | Записи `stream_warn` в логе | Разбор потока идёт с ошибками: `unparseable` — строка не разобралась (дрейф формата), `too_long` — строка сверх предела длины, `no_result_line` — процесс закончился без итоговой строки `result`. Одна запись на класс на процесс; количество — в `progress.bad_lines`/`oversize_lines`. |
 | `progress` пустой у идущей задачи | Либо `streamEvents: false` (тогда это норма), либо CLI не поддерживает `stream-json`. Проверьте `progress.streaming` и записи `stream_warn`. |
 | `unknown_event_types` непустой | CLI начал слать типы событий, которых мост не знает. Само по себе не ошибка — счётчик нужен, чтобы дрейф формата был заметен заранее. |
