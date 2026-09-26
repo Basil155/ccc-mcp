@@ -25,8 +25,12 @@ export const ConfigSchema = z.object({
    * headless-режиму: такой вызов падает с 403 ещё до начала работы.
    */
   model: z.string().min(1).optional(),
-  /** Таймаут на зависший процесс, мс. По умолчанию 30 минут. */
-  timeoutMs: z.number().int().positive().default(30 * 60 * 1000),
+  /**
+   * Таймаут на зависший процесс, мс. По умолчанию 90 минут: 30 не хватало задачам
+   * с долгими тестами, а зависание в ожидании пропавшего оператора теперь ловит
+   * operatorAbsentMinutes, а не этот лимит.
+   */
+  timeoutMs: z.number().int().positive().default(90 * 60 * 1000),
   /** Сколько секунд инструмент ждёт результата, прежде чем уйти в async. */
   defaultWaitSeconds: z.number().int().min(0).max(120).default(20),
   /** Сколько процессов claude разрешено держать одновременно. */
@@ -186,6 +190,34 @@ export const ConfigSchema = z.object({
    * не обязательно годится для разведки. Сравнение то же — строка целиком.
    */
   planAutoApproveCommands: z.array(z.string().min(1)).default([]),
+  /**
+   * Пропускать в plan_task без оператора Bash-команды, которые только читают
+   * (grep, ls, find, cat, sed -n, git log/show/diff, docker ps/logs/inspect…).
+   *
+   * Точного списка для разведки мало: модель почти не повторяет команды
+   * дословно, и 24.09 восемь plan_task дали ~130 ручных одобрений. Классификатор
+   * (src/readOnlyCommand.ts) консервативен: интерпретаторы, запись куда-либо
+   * кроме /dev/null, подстановки команд, docker exec, сеть и пути к секретам
+   * (.env, *.pem, …) по-прежнему идут оператору. false — вернуть строгий режим.
+   */
+  planAutoApproveReadOnly: z.boolean().default(true),
+  /**
+   * То же для execute_task. Одобрение плана уже дано, а читающая команда
+   * ничего не меняет: 26.09 execute_task упёрся в часовой таймаут, потратив его
+   * на 42 ручных одобрения и 4 ждущих grep. Пишущее по-прежнему идёт оператору.
+   */
+  executeAutoApproveReadOnly: z.boolean().default(true),
+  /**
+   * Через сколько минут молчания оператора мост перестаёт ждать его решений по
+   * задаче: ждущие и новые запросы получают окончательный отказ с просьбой
+   * продолжить без операции и перечислить её в отчёте. Молчание — нет ни
+   * get_task_status, ни approve_permission_request, ни cancel_task, ни list_tasks
+   * с момента последнего обращения. 0 — ждать всегда (до таймаута задачи).
+   *
+   * 24.09 execute_task 70 минут ждал решений, которые некому было принять, и
+   * кончился таймаутом без отчёта.
+   */
+  operatorAbsentMinutes: z.number().int().min(0).max(240).default(10),
 });
 
 export type RawConfig = z.infer<typeof ConfigSchema>;

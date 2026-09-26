@@ -80,6 +80,8 @@ interface PermissionRequestView {
   allowed_count: number;
   first_seen_at: string;
   last_seen_at: string;
+  /** Отказ выдал мост: оператор не выходил на связь дольше operatorAbsentMinutes. */
+  operator_absent: boolean;
 }
 
 function toPermissionView(r: PermissionRequest): PermissionRequestView {
@@ -92,6 +94,7 @@ function toPermissionView(r: PermissionRequest): PermissionRequestView {
     allowed_count: r.allowedCount,
     first_seen_at: new Date(r.firstSeenAt).toISOString(),
     last_seen_at: new Date(r.lastSeenAt).toISOString(),
+    operator_absent: r.operatorAbsent,
   };
 }
 
@@ -481,6 +484,8 @@ async function main(): Promise<void> {
   }
 
   const jobs = new JobRegistry(config.jobRetentionMs);
+  // Граница памяти реестра задач: всё, что стартовало раньше, в нём не найти.
+  const serverStartedAt = Date.now();
   const sessions = new SessionRegistry(config.sessionRetentionMs);
 
   logger.stderr(
@@ -493,7 +498,10 @@ async function main(): Promise<void> {
     { name: "ccc-mcp", version: SERVER_VERSION },
     {
       instructions:
-        "Мост к локальной установке Claude Code. Действует обязательный протокол из трёх шагов: " +
+        "Мост к локальной установке Claude Code. В начале работы вызовите get_bridge_info: он " +
+        "вернёт версию моста и настройки, от которых зависит ваша работа с ним (таймауты, контроль " +
+        "разрешений, списки автоодобрения, допустимые каталоги, лимиты). " +
+        "Действует обязательный протокол из трёх шагов: " +
         "1) plan_task — получить план. Это разведка, а не песочница: правку файлов режим плана " +
         "запрещает, но Bash-команды выполняются по правилам разрешений пользователя, поэтому при " +
         "включённом контроле разрешений они, как и в execute_task, ждут решения оператора; " +
@@ -509,6 +517,8 @@ async function main(): Promise<void> {
         "раздел «Открытые вопросы» и has_open_questions: true — такой план одобрять нельзя, " +
         "задайте эти вопросы пользователю и вызовите plan_task заново с уточнённой задачей. " +
         "Долгие задачи уходят в фон: если пришёл status \"running\", опрашивайте get_task_status по process_id. " +
+        "Если ответ plan_task или execute_task потерялся (оборвалось соединение, истёк таймаут клиента), " +
+        "не запускайте задачу заново: list_tasks покажет идущие и недавние задачи с их process_id. " +
         "Идущая задача не чёрный ящик: в каждом ответе есть progress — вызовы инструментов, " +
         "tools_used, last_tool_call, последнее видимое сообщение модели, idle_seconds и лента " +
         "recent_events, а next_step называет то, что с задачей происходит прямо сейчас " +
@@ -520,7 +530,9 @@ async function main(): Promise<void> {
         "Если включён контроль разрешений, get_task_status может вернуть permission_requests с " +
         "decision \"pending\" — это операции, которые дочерний Claude Code хочет выполнить прямо " +
         "сейчас. Покажите их пользователю и проведите через approve_permission_request: без решения " +
-        "они будут отклонены. " +
+        "они будут отклонены. Опрашивайте идущую задачу хотя бы раз в несколько минут: если к ней " +
+        "долго никто не обращается, мост считает оператора ушедшим и отклоняет её запросы сам " +
+        "(operator_absent: true), а задача продолжает без этих операций. " +
         "Отдельно от этого протокола есть три файловых инструмента: list_project_files, " +
         "read_project_file и write_project_file работают с файлами проекта напрямую, без " +
         "запуска Claude Code и без цикла план → одобрение → выполнение. Используйте их, когда " +
@@ -610,8 +622,9 @@ async function main(): Promise<void> {
 
     // Мост поднимаем ДО спавна: порт выдаёт ОС, а он нужен уже в --settings.
     // И для plan_task тоже: plan-режим CLI не изолирует Bash (см.
-    // PLAN_SENSITIVE_TOOLS), так что команды разведки идут оператору, кроме
-    // своего списка planAutoApproveCommands.
+    // PLAN_SENSITIVE_TOOLS). Читающие команды мост пропускает сам
+    // (planAutoApproveReadOnly), остальные идут оператору, кроме своего списка
+    // planAutoApproveCommands.
     const isPlan = params.tool === "plan_task";
     const hookTools = isPlan ? PLAN_SENSITIVE_TOOLS : config.sensitiveTools;
     const bridge = config.hooksEnabled
@@ -621,6 +634,16 @@ async function main(): Promise<void> {
           maxPendingRequests: config.maxPendingRequests,
           allowWaitCommand: config.allowWaitCommand,
           autoApproveCommands: isPlan ? config.planAutoApproveCommands : config.autoApproveCommands,
+          autoApproveReadOnly: isPlan
+            ? config.planAutoApproveReadOnly
+            : config.executeAutoApproveReadOnly,
+          // Job появится после спавна; до этого оператор заведомо на связи —
+          // он только что запустил задачу.
+          operatorAbsentMs: () => {
+            if (logJob === null || config.operatorAbsentMinutes === 0) return null;
+            const silent = Date.now() - logJob.lastOperatorContactAt;
+            return silent > config.operatorAbsentMinutes * 60_000 ? silent : null;
+          },
           holdMs: config.permissionHoldSeconds * 1000,
           logger,
         })
@@ -911,9 +934,9 @@ async function main(): Promise<void> {
         "Запускает Claude Code в режиме планирования (--permission-mode plan): он изучает проект " +
         "и возвращает план. Это не песочница: режим плана запрещает правку файлов, но не запуск " +
         "команд — Bash выполняется по правилам разрешений пользователя (permissions.allow). " +
-        "Поэтому при включённом контроле разрешений (hooksEnabled) каждая Bash-команда, кроме " +
-        "списка planAutoApproveCommands, ждёт решения оператора: опрашивайте get_task_status и " +
-        "проводите permission_requests через approve_permission_request, как для execute_task. " +
+        "Поэтому при включённом контроле разрешений (hooksEnabled) Bash-команды, которые не " +
+        "только читают, ждут решения оператора: опрашивайте get_task_status и проводите " +
+        "permission_requests через approve_permission_request, как для execute_task. " +
         "Задачу «выполни» сюда не отправляйте: план строится, работа не делается. " +
         "Интерактивные вопросы в этом режиме запрещены: " +
         "если информации не хватает, план придёт с разделом «Открытые вопросы» и полем " +
@@ -1154,9 +1177,11 @@ async function main(): Promise<void> {
         if (!job) {
           return errorResult(
             `Задача ${args.process_id} не найдена. Реестр живёт только пока запущен сервер, ` +
-              `а завершённые задачи хранятся ограниченное время. История вызовов — в логе ${config.resolvedLogFile}.`,
+              `а завершённые задачи хранятся ограниченное время. Список известных задач — list_tasks, ` +
+              `история вызовов — в логе ${config.resolvedLogFile}.`,
           );
         }
+        job.lastOperatorContactAt = Date.now();
         if (!job.bridge) {
           return errorResult(
             `Для задачи ${args.process_id} контроль разрешений не включён ` +
@@ -1256,15 +1281,189 @@ async function main(): Promise<void> {
       if (!job) {
         return errorResult(
           `Задача ${args.process_id} не найдена. Реестр живёт только пока запущен сервер, ` +
-            `а завершённые задачи хранятся ограниченное время. История вызовов — в логе ${config.resolvedLogFile}.`,
+            `а завершённые задачи хранятся ограниченное время. Список известных задач — list_tasks, ` +
+            `история вызовов — в логе ${config.resolvedLogFile}.`,
         );
       }
+      // Опрос — знак, что оператор на связи; пока он ждёт внутри wait_seconds —
+      // тоже, поэтому отмечаем и до, и после ожидания.
+      job.lastOperatorContactAt = Date.now();
       // Ждать завершения, но не пропустить запрос на разрешение: без этого
       // pending виден только со следующего опроса, уже после wait_seconds.
       const waitReason = await waitForJob(job, args.wait_seconds ?? 0, {
         wakeOnPendingPermission: true,
       });
+      job.lastOperatorContactAt = Date.now();
       return toolResult(reportFor(job, waitReason));
+    },
+  );
+
+  server.registerTool(
+    "get_bridge_info",
+    {
+      title: "Версия и настройки моста",
+      description:
+        "Возвращает версию моста и Claude Code и действующие настройки, от которых зависит работа " +
+        "агента: сколько может идти задача и сколько их можно запускать сразу, включён ли контроль " +
+        "разрешений и какие команды проходят без одобрения (списки целиком — используйте эти " +
+        "команды дословно, тогда они не потребуют одобрения), через сколько минут молчания мост " +
+        "перестаёт ждать решений оператора, в каких каталогах можно работать и какого размера " +
+        "файлы читать. Ничего не запускает и не меняет; вызывайте в начале работы и после " +
+        "перезапуска сервера (server_started_at).",
+      inputSchema: {},
+    },
+    async () => {
+      const running = jobs.list().filter((j) => j.status === "running").length;
+      const payload = {
+        server: {
+          name: "ccc-mcp",
+          version: SERVER_VERSION,
+          server_started_at: new Date(serverStartedAt).toISOString(),
+          platform: process.platform,
+          claude_version: runner.claudeVersion,
+          default_model: runner.resolveModel(undefined),
+          sandbox: { mode: config.sandbox, supported: runner.supportsSandbox },
+        },
+        tasks: {
+          timeout_minutes: Math.round(config.timeoutMs / 60_000),
+          default_wait_seconds: config.defaultWaitSeconds,
+          max_wait_seconds: 120,
+          max_concurrent: config.maxConcurrent,
+          running_now: running,
+          stream_events: config.streamEvents,
+          session_retention_hours: Math.round(config.sessionRetentionMs / 3_600_000),
+          job_retention_minutes: Math.round(config.jobRetentionMs / 60_000),
+        },
+        permissions: {
+          hooks_enabled: config.hooksEnabled,
+          ...(config.hooksEnabled
+            ? {
+                plan_hooked_tools: PLAN_SENSITIVE_TOOLS,
+                execute_hooked_tools: config.sensitiveTools,
+                hold_seconds: config.permissionHoldSeconds,
+                retry_budget: config.retryBudget,
+                max_pending_requests: config.maxPendingRequests,
+                operator_absent_minutes: config.operatorAbsentMinutes,
+                allow_wait_command: config.allowWaitCommand,
+                plan_auto_approve_read_only: config.planAutoApproveReadOnly,
+                execute_auto_approve_read_only: config.executeAutoApproveReadOnly,
+                auto_approve_commands: config.autoApproveCommands,
+                plan_auto_approve_commands: config.planAutoApproveCommands,
+              }
+            : {}),
+          execute_permission_modes: PERMISSION_MODES,
+        },
+        files: {
+          allowed_roots: config.resolvedRoots,
+          max_file_bytes: config.maxFileBytes,
+          max_list_entries: config.maxListEntries,
+        },
+        git: {
+          available: git.error === null,
+          version: git.version,
+          max_diff_bytes: config.maxDiffBytes,
+          timeout_seconds: Math.round(config.gitTimeoutMs / 1000),
+        },
+        next_step:
+          (config.hooksEnabled
+            ? `Опрашивайте идущие задачи чаще, чем раз в ${config.operatorAbsentMinutes} мин ` +
+              `(operator_absent_minutes), иначе мост перестанет ждать ваших решений по разрешениям. `
+            : "") +
+          `Задача дольше ${Math.round(config.timeoutMs / 60_000)} мин будет остановлена по таймауту.`,
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+        structuredContent: payload as unknown as Record<string, unknown>,
+        isError: false,
+      };
+    },
+  );
+
+  server.registerTool(
+    "list_tasks",
+    {
+      title: "Список задач",
+      description:
+        "Показывает идущие и недавние задачи plan_task/execute_task этого сервера, от новых к " +
+        "старым: process_id, инструмент, статус, проект, session_id, время старта и выжимку текста " +
+        "задачи. Нужен, когда process_id потерялся — например, ответ plan_task не дошёл из-за " +
+        "обрыва соединения: прежде чем запускать задачу заново, проверьте здесь, не идёт ли она " +
+        "уже, иначе две копии будут делать одну работу за двойные деньги. Реестр живёт в памяти: " +
+        "после перезапуска сервера он пуст (server_started_at в ответе), а завершённые задачи " +
+        "хранятся ограниченное время. Полный отчёт по задаче — get_task_status.",
+      inputSchema: {
+        project_dir: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Показать только задачи этого проекта. Должен быть внутри белого списка сервера."),
+        status: z
+          .enum(["running", "all"])
+          .optional()
+          .describe("running — только идущие; all (по умолчанию) — идущие и недавние завершённые."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .optional()
+          .describe("Сколько задач вернуть, самые новые первыми. По умолчанию 20."),
+      },
+    },
+    async (args) => {
+      try {
+        const dir =
+          args.project_dir !== undefined
+            ? validateProjectDir(args.project_dir, config.resolvedRoots)
+            : null;
+        const matching = jobs
+          .list()
+          .filter((j) => dir === null || j.projectDir === dir)
+          .filter((j) => args.status !== "running" || j.status === "running");
+        const limit = args.limit ?? 20;
+        const now = Date.now();
+        // Оператор смотрит на свои задачи — он на связи по всем идущим.
+        for (const j of matching) if (j.status === "running") j.lastOperatorContactAt = now;
+        const tasks = matching.slice(0, limit).map((j) => ({
+          process_id: j.processId,
+          tool: j.tool,
+          status: j.status,
+          ok: j.result?.ok ?? null,
+          project_dir: j.projectDir,
+          model: j.model,
+          session_id:
+            j.result?.sessionId ?? j.progress.snapshot().sessionId ?? j.requestedSessionId,
+          started_at: new Date(j.startedAt).toISOString(),
+          finished_at: j.finishedAt !== null ? new Date(j.finishedAt).toISOString() : null,
+          last_operator_contact_at: new Date(j.lastOperatorContactAt).toISOString(),
+          elapsed_seconds: Math.round(((j.finishedAt ?? now) - j.startedAt) / 1000),
+          pending_permission_count: j.bridge?.pendingCount() ?? 0,
+          task_preview: j.taskPreview,
+        }));
+        const running = tasks.filter((t) => t.status === "running");
+        const payload = {
+          server_started_at: new Date(serverStartedAt).toISOString(),
+          count: tasks.length,
+          total_matching: matching.length,
+          tasks,
+          next_step:
+            running.length > 0
+              ? `Идёт задач: ${running.length}. Подключитесь к нужной через get_task_status с её ` +
+                `process_id (можно с wait_seconds), а не запускайте её заново.`
+              : tasks.length > 0
+                ? "Идущих задач нет. Отчёт по завершённой — get_task_status с её process_id."
+                : "Задач нет: с момента server_started_at ничего не запускалось, либо завершённые " +
+                  "уже вытеснены из памяти. Если ответ на запуск потерялся и задачи здесь нет, " +
+                  "до сервера она не дошла — её можно запускать заново.",
+        };
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+          structuredContent: payload as unknown as Record<string, unknown>,
+          isError: false,
+        };
+      } catch (err) {
+        return errorResult(describeError(err));
+      }
     },
   );
 
@@ -1287,6 +1486,7 @@ async function main(): Promise<void> {
       if (!job) {
         return errorResult(`Задача ${args.process_id} не найдена.`);
       }
+      job.lastOperatorContactAt = Date.now();
       if (job.status !== "running") {
         return toolResult(reportFor(job));
       }

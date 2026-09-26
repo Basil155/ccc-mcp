@@ -18,6 +18,12 @@ export interface Job {
   status: JobStatus;
   startedAt: number;
   finishedAt: number | null;
+  /**
+   * Когда оператор последний раз обращался к задаче: запуск, get_task_status,
+   * approve_permission_request, cancel_task, list_tasks. По нему мост решает,
+   * что оператора нет (operatorAbsentMinutes), и перестаёт ждать его решений.
+   */
+  lastOperatorContactAt: number;
   pid: number | undefined;
   result: ParsedResult | null;
   exitCode: number | null;
@@ -55,14 +61,22 @@ export class JobRegistry {
   create(
     init: Omit<
       Job,
-      "processId" | "status" | "startedAt" | "finishedAt" | "result" | "exitCode"
+      | "processId"
+      | "status"
+      | "startedAt"
+      | "finishedAt"
+      | "result"
+      | "exitCode"
+      | "lastOperatorContactAt"
     >,
   ): Job {
+    const now = Date.now();
     const job: Job = {
       ...init,
       processId: randomUUID(),
       status: "running",
-      startedAt: Date.now(),
+      startedAt: now,
+      lastOperatorContactAt: now,
       finishedAt: null,
       result: null,
       exitCode: null,
@@ -73,6 +87,11 @@ export class JobRegistry {
 
   get(processId: string): Job | undefined {
     return this.jobs.get(processId);
+  }
+
+  /** Все задачи реестра, от новых к старым. */
+  list(): Job[] {
+    return [...this.jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
   }
 
   /**

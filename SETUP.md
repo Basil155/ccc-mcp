@@ -73,7 +73,7 @@ cp ccc-mcp.config.example.json ccc-mcp.config.json
 |---|---|---|
 | `allowedRoots` | — (обязателен) | Главная настройка безопасности. Список абсолютных путей, внутри которых мосту разрешено работать |
 | `defaultWaitSeconds` | `20` | Сколько ждать результат до ухода в фон. Держите заметно ниже таймаута MCP-клиента (обычно ~60 с) |
-| `timeoutMs` | `1800000` (30 мин) | Если задачи бывают длиннее |
+| `timeoutMs` | `5400000` (90 мин) | Если задачи бывают длиннее |
 | `maxConcurrent` | `3` | Сколько процессов `claude` разрешено одновременно |
 | `sessionRetentionMs` | `86400000` (сутки) | Срок жизни плана и одобрения |
 | `jobRetentionMs` | `3600000` (час) | Сколько завершённых задач доступно через `get_task_status` |
@@ -97,6 +97,9 @@ cp ccc-mcp.config.example.json ccc-mcp.config.json
 | `allowWaitCommand` | `true` | Пропускать ли синхронный `sleep N` (N ≤ 60) без одобрения — пауза, чтобы модель дождалась решения. Тот же `sleep` с `run_in_background: true` требует одобрения: он возвращается мгновенно и ждать модель не заставляет. Это разрешение моста, а не гарантия: там, где `sleep` в `Bash` запрещён политикой самого CLI, модель ждёт другим способом |
 | `autoApproveCommands` | `[]` | Команды `Bash`, проходящие без одобрения, — чтобы не подтверждать вручную десятки одинаковых `npm run typecheck` за прогон. Сравнение по **всей строке целиком** (пробелы по краям отбрасываются, внутренние — нет): `npm run typecheck && rm -rf /` не подпадает под `npm run typecheck`. Класть сюда стоит только детерминированные проверки, не тратящие деньги и не ходящие в сеть; `npm run smoke` без `--no-live` под это не подходит — он порождает дочерние процессы `claude`. Автоодобренный вызов в `permission_requests` не появляется, его след — строка лога с `"decision": "auto_allowed"` |
 | `planAutoApproveCommands` | `[]` | То же для `plan_task`: при `hooksEnabled` каждая Bash-команда планирования, кроме этого списка, ждёт оператора. Отдельный список: годное для выполнения не обязательно годится для разведки (`npm run build` пишет `dist/`). См. [docs/permissions.md](docs/permissions.md#планирование) |
+| `planAutoApproveReadOnly` | `true` | Пропускать в `plan_task` без оператора Bash-команды, которые только читают (`grep`, `ls`, `find`, `sed -n`, `git log`, `docker ps/logs`…). Интерпретаторы, запись, подстановки команд, `docker exec` и пути к секретам по-прежнему идут оператору. `false` — строгий режим. См. [docs/permissions.md](docs/permissions.md#автоодобрение-читающих-команд-planautoapprovereadonly-executeautoapprovereadonly) |
+| `executeAutoApproveReadOnly` | `true` | То же для `execute_task`: читающие Bash-команды проходят без оператора, пишущие по-прежнему ждут его (или `autoApproveCommands`) |
+| `operatorAbsentMinutes` | `10` | Через сколько минут молчания оркестратора (ни `get_task_status`, ни `approve_permission_request`, ни `cancel_task`, ни `list_tasks`) мост перестаёт ждать решений: ждущие и новые запросы получают окончательный отказ с просьбой продолжить без операции и отчитаться. `0` — ждать до таймаута задачи. См. [docs/permissions.md](docs/permissions.md#оператор-не-на-связи-operatorabsentminutes) |
 
 Переменные окружения перекрывают файл: `CCC_ALLOWED_ROOTS` (несколько путей через `;`),
 `CCC_CLAUDE_BIN`, `CCC_GIT_BIN`, `CCC_MODEL`, `CCC_TIMEOUT_MS`, `CCC_LOG_FILE`,

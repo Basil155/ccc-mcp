@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { preview, type Logger } from "./logger.js";
+import { isReadOnlyCommand } from "./readOnlyCommand.js";
 
 /**
  * Мост PreToolUse-хуков: HTTP-эндпоинт, который решает, пропускать ли
@@ -80,6 +81,11 @@ export interface PermissionRequest {
   resolvedAt: number | null;
   /** Комментарий оператора при allow/deny. */
   resolvedReason: string | null;
+  /**
+   * Отказ выдал мост, а не человек: оператор не выходил на связь дольше
+   * operatorAbsentMs. Решение окончательное, как у отказа оператора.
+   */
+  operatorAbsent: boolean;
 }
 
 export interface HookBridgeOptions {
@@ -92,6 +98,23 @@ export interface HookBridgeOptions {
    * Пустой список (дефолт) полностью выключает механизм.
    */
   autoApproveCommands: string[];
+  /**
+   * Пропускать без оператора Bash-команды, которые классификатор признал
+   * читающими (isReadOnlyCommand). Включается только для plan_task: там почти
+   * вся работа — grep/ls/find, и ручное одобрение каждой команды делало
+   * планирование медленным и дорогим. Не задано — выключено.
+   */
+  autoApproveReadOnly?: boolean;
+  /**
+   * Сколько миллисекунд оператор не выходил на связь по этой задаче — или null,
+   * если он на связи (или механизм выключен). Задаёт владелец задачи: мост сам не
+   * знает, когда оператор последний раз её опрашивал.
+   *
+   * Зачем: 24.09 execute_task 70 минут ждал решения по двум запросам, которые
+   * некому было принять (оркестратор потерял связь), и закончился таймаутом без
+   * отчёта. Отказ «оператора нет» даёт модели продолжить без операции и отчитаться.
+   */
+  operatorAbsentMs?: () => number | null;
   /**
    * Сколько держать HTTP-запрос хука открытым в ожидании решения оператора, мс.
    * 0 (дефолт класса) — отвечать отказом сразу и полагаться на повтор моделью.
@@ -266,6 +289,15 @@ function operatorDeniedReason(requestId: string, reason: string | null): string 
   return (
     `${SOURCE} оператор отклонил запрос ${requestId}.${comment} Повтор будет отклонён так же. ` +
     `Продолжите без этой операции и укажите в итоговом отчёте, что не сделано.`
+  );
+}
+
+function operatorAbsentReason(requestId: string, minutes: number): string {
+  return (
+    `${SOURCE} запрос ${requestId} не одобрен: оператор не выходит на связь уже ${minutes} мин. ` +
+    `Ждать и повторять эту операцию не нужно — повтор будет отклонён так же. Продолжите то, что ` +
+    `можно сделать без неё, и перечислите в итоговом отчёте всё, что осталось несделанным ` +
+    `из-за отсутствия одобрения.`
   );
 }
 
@@ -625,8 +657,15 @@ export class HookBridge {
     // нечего. В лог идёт отдельным decision — аудит обязан отличать
     // автоодобрение от решения человека.
     if (this.isAutoApprovedCommand(toolName, toolInput)) {
-      this.logAutoAllowed(toolName, toolInput);
+      this.logAutoAllowed(toolName, toolInput, "exact");
       return allow("Команда входит в список автоодобрения оператора.");
+    }
+
+    // Читающая команда в планировании. Классификатор консервативен: всё, в чём он
+    // не уверен, идёт дальше обычным путём, к оператору.
+    if (this.isReadOnlyAutoApproved(toolName, toolInput)) {
+      this.logAutoAllowed(toolName, toolInput, "read_only");
+      return allow("Команда только читает — одобрена мостом без оператора.");
     }
 
     const requestId = computeRequestId(toolName, toolInput);
@@ -640,6 +679,13 @@ export class HookBridge {
         existing.allowedCount++;
         this.log(existing, "allow");
         return allow(`Операция одобрена оператором (запрос ${requestId}).`);
+      }
+
+      // Оператора нет: ждущий запрос закрываем окончательным отказом, а не
+      // гоняем модель по кругу «подожди и повтори» до таймаута задачи.
+      if (existing.decision === "pending") {
+        const absent = this.absentMinutes();
+        if (absent !== null) return this.denyAbsent(existing, absent, now);
       }
 
       // Удерживаемая попытка ещё не отказ: засчитается, только если ей в итоге
@@ -717,8 +763,17 @@ export class HookBridge {
       lastSeenAt: now,
       resolvedAt: null,
       resolvedReason: null,
+      operatorAbsent: false,
     };
     this.requests.set(requestId, created);
+    // Оператора нет — не держим вызов и не просим повторить: сразу окончательный
+    // отказ. Запись всё равно заводим, чтобы оператор, вернувшись, увидел, что
+    // именно не было сделано.
+    const absent = this.absentMinutes();
+    if (absent !== null) {
+      created.deniedCount = 0;
+      return this.denyAbsent(created, absent, now);
+    }
     // Главное место пробуждения: именно здесь у оператора появляется работа.
     // При удержании лог пишется по итогу — одобрением или отказом по таймеру.
     if (this.holding) {
@@ -728,6 +783,24 @@ export class HookBridge {
     this.log(created, "deny");
     this.notifyPending();
     return deny(pendingReason(requestId, 1, this.opts.retryBudget, this.opts.allowWaitCommand));
+  }
+
+  /** Минуты молчания оператора, если он считается отсутствующим, иначе null. */
+  private absentMinutes(): number | null {
+    const ms = this.opts.operatorAbsentMs?.() ?? null;
+    return ms === null ? null : Math.max(1, Math.round(ms / 60_000));
+  }
+
+  /** Окончательный отказ за отсутствием оператора. */
+  private denyAbsent(record: PermissionRequest, minutes: number, now: number): HookDecision {
+    record.deniedCount++;
+    record.decision = "denied";
+    record.operatorAbsent = true;
+    record.resolvedAt = now;
+    record.resolvedReason = `оператор не выходил на связь ${minutes} мин`;
+    this.log(record, "deny");
+    this.notifyPending();
+    return deny(operatorAbsentReason(record.requestId, minutes));
   }
 
   /** Держать ли ответ в ожидании оператора, а не отказывать сразу. */
@@ -784,7 +857,7 @@ export class HookBridge {
    * обычным путём. denied_count/allowed_count намеренно отсутствуют — считать
    * тут нечего.
    */
-  private logAutoAllowed(toolName: string, toolInput: unknown): void {
+  private logAutoAllowed(toolName: string, toolInput: unknown, rule: "exact" | "read_only"): void {
     this.opts.logger.write({
       event: "hook",
       process_id: this.processId,
@@ -793,7 +866,23 @@ export class HookBridge {
       summary: summarizeToolInput(toolName, toolInput),
       outcome: "allow",
       decision: "auto_allowed",
+      rule,
     });
+  }
+
+  /**
+   * Bash-команда, признанная читающей, при включённом autoApproveReadOnly.
+   * Те же ограничения на поля tool_input, что у точного списка.
+   */
+  private isReadOnlyAutoApproved(toolName: string, toolInput: unknown): boolean {
+    if (!this.opts.autoApproveReadOnly || toolName !== "Bash") return false;
+    if (!toolInput || typeof toolInput !== "object" || Array.isArray(toolInput)) return false;
+    const input = toolInput as Record<string, unknown>;
+    for (const key of Object.keys(input)) {
+      if (!AUTO_APPROVE_BASH_FIELDS.has(key)) return false;
+    }
+    const command = input["command"];
+    return typeof command === "string" && isReadOnlyCommand(command);
   }
 
   private log(record: PermissionRequest, outcome: "allow" | "deny"): void {
@@ -807,6 +896,7 @@ export class HookBridge {
       outcome,
       denied_count: record.deniedCount,
       allowed_count: record.allowedCount,
+      ...(record.operatorAbsent ? { operator_absent: true } : {}),
     });
   }
 

@@ -11,6 +11,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { HOOK_TIMEOUT_MARGIN_SECONDS, HookBridge } from "../dist/hookBridge.js";
+import { isReadOnlyCommand } from "../dist/readOnlyCommand.js";
 import { waitForJob } from "../dist/jobs.js";
 import { isValidBranchName } from "../dist/gitOps.js";
 import { detectPatterns, diagnose } from "../dist/diagnose.js";
@@ -182,10 +183,11 @@ try {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   check(
-    "зарегистрированы 10 инструментов",
+    "зарегистрированы 12 инструментов",
     names.join(",") ===
-      "approve_permission_request,approve_plan,cancel_task,execute_task,get_task_status," +
-        "list_project_files,plan_task,read_project_file,run_git,write_project_file",
+      "approve_permission_request,approve_plan,cancel_task,execute_task,get_bridge_info," +
+        "get_task_status,list_project_files,list_tasks,plan_task,read_project_file,run_git," +
+        "write_project_file",
     `получено: ${names.join(", ")}`,
   );
 
@@ -198,6 +200,47 @@ try {
     serverInfo?.version === pkgVersion,
     `сервер: ${serverInfo?.version}, package.json: ${pkgVersion}`,
   );
+
+  {
+    const infoRes = await client.callTool({ name: "get_bridge_info", arguments: {} });
+    const info = JSON.parse(infoRes.content[0].text);
+    const raw = infoRes.content[0].text;
+    check(
+      "get_bridge_info: версия из package.json, время старта и версия claude",
+      info.server?.version === pkgVersion &&
+        typeof info.server.server_started_at === "string" &&
+        typeof info.server.claude_version === "string",
+      JSON.stringify(info.server),
+    );
+    check(
+      "get_bridge_info: таймаут, ожидание и параллельность из конфига",
+      info.tasks?.timeout_minutes === 5 &&
+        info.tasks.default_wait_seconds === 0 &&
+        info.tasks.max_wait_seconds === 120 &&
+        typeof info.tasks.max_concurrent === "number",
+      JSON.stringify(info.tasks),
+    );
+    check(
+      "get_bridge_info: при выключенных хуках раздел разрешений без подробностей",
+      info.permissions?.hooks_enabled === false &&
+        info.permissions.operator_absent_minutes === undefined &&
+        info.permissions.auto_approve_commands === undefined,
+      JSON.stringify(info.permissions),
+    );
+    check(
+      "get_bridge_info: допустимые каталоги и лимиты файлов",
+      Array.isArray(info.files?.allowed_roots) &&
+        info.files.allowed_roots.length === 1 &&
+        typeof info.files.max_file_bytes === "number" &&
+        info.git?.max_diff_bytes === 2048,
+      JSON.stringify({ files: info.files, git: info.git }),
+    );
+    check(
+      "get_bridge_info не раскрывает passEnv, путь к логу и путь к claude",
+      !/passEnv|pass_env|log_file|logFile|claude_bin|claudeBin/.test(raw),
+      raw.slice(0, 300),
+    );
+  }
 
   for (const name of ["plan_task", "execute_task"]) {
     const props = tools.find((t) => t.name === name)?.inputSchema?.properties ?? {};
@@ -927,6 +970,221 @@ try {
     );
   } finally {
     noAutoBridge.stopListening();
+  }
+
+  console.log("\n2e-ro. Классификатор читающих команд для plan_task");
+  {
+    // Реальные команды разведки из plan_task 24.09 и близкие к ним.
+    const readOnly = [
+      "ls -la tools/verify-a3-b5/",
+      "grep -rn 'CallReconciler' --include=*.cs backend/ | grep -v '/obj/' | head -30",
+      `grep -n "MapDelete\\|Evict" backend/src/Endpoints.cs | head -40`,
+      "find backend -name '*.csproj' -not -path '*/obj/*' | sort",
+      "find backend -name '*.csproj' | xargs grep -l -i livekit 2>/dev/null",
+      "sed -n '1,60p' infra/docker-compose.yml",
+      "sed -n '/^volumes:/,$p' infra/docker-compose.yml",
+      "cat backend/Dockerfile && wc -l tools/run.py",
+      "cd backend && grep -rn --include=\"*.cs\" \"xmin\" src/ ; echo \"EXIT: $?\"",
+      "X=~/.nuget/packages/lk/1.2.3/LivekitApi.xml; grep -n 'UpdateParticipant' \"$X\" | head",
+      "docker ps --format '{{.Names}}\\t{{.Status}}'",
+      "docker logs --since 20m app-livekit 2>&1 | grep -v $'\\t' | head -5",
+      "docker inspect app-api --format '{{.Config.Image}}'",
+      "docker compose -f docker-compose.yml -f docker-compose.dev.yml ps",
+      "git log --oneline -3 && git status --short",
+      "git show --stat 72cdb46 | head -40",
+      "git -C backend diff HEAD~1 -- src/",
+      "awk 'NR==160' docs/plan.md | cut -c1-1200",
+      "strings -a lib/LivekitApi.dll 2>/dev/null | grep -iE 'twirp' | sort -u | head",
+      "head -45 tests/CoturnCredentialServiceTests.cs",
+      "date -u +%H:%M:%SZ; pgrep -fl chromium",
+      "dotnet --list-sdks",
+      // Шаблоны .env без значений — не секреты.
+      "grep -n 'OBJECTSTORE' infra/docker-compose.yml infra/.env.example",
+      "cat .env.sample",
+    ];
+    const needsOperator = [
+      // Интерпретаторы, запуск по пути, сеть, docker exec.
+      "python3 -c \"open('x','w').write('y')\"",
+      "./w.sh m1",
+      "tools/verify/.venv/bin/python run.py reset",
+      "curl -s http://localhost:8080/",
+      "docker exec app-postgres psql -c 'SELECT 1'",
+      "docker compose up -d --build",
+      "docker compose -f a.yml down",
+      "npm run build",
+      // Запись.
+      "strings lib/x.dll > /tmp/out.txt",
+      "grep -n x f >> log.txt",
+      "echo hi | tee out.txt",
+      "sed -i 's/a/b/' file.txt",
+      "sed 's/a/b/w out.txt' file.txt",
+      "find . -name '*.tmp' -delete",
+      "find . -exec rm {} \\;",
+      "sort -o out.txt in.txt",
+      "uniq in.txt out.txt",
+      "awk '{print > \"out.txt\"}' in.txt",
+      "awk 'BEGIN{system(\"rm -rf x\")}'",
+      "git checkout main",
+      "git branch new-feature",
+      "git -c core.pager='rm -rf x' log",
+      "git diff --output=patch.txt",
+      "rg --pre ./evil.sh pattern",
+      "xargs rm < list.txt",
+      "ls | xargs -I{} sh -c 'rm {}'",
+      // Подстановки, фон, циклы, heredoc, присваивание перед командой.
+      "cat $(which foo)",
+      "cat `which foo`",
+      "echo \"$(rm -rf x)\"",
+      "diff <(ls a) <(ls b)",
+      "sleep 100 &",
+      "for f in *.cs; do cat $f; done",
+      "cat <<EOF\nx\nEOF",
+      "(cd x && ls)",
+      "GIT_EXTERNAL_DIFF=./x.sh git diff",
+      "LD_PRELOAD=./x.so cat f",
+      // Секреты оператор видит всегда.
+      "grep -n 'API_SECRET' infra/.env",
+      "cat ~/.ssh/id_rsa",
+      "cat certs/server.key",
+      "cat ~/.aws/credentials",
+      "ls secrets/",
+      "cat .env.production",
+      "cat .env.example.local",
+      "cat secrets/.env.example",
+    ];
+    for (const c of readOnly) {
+      check(`читающая: ${c.replace(/\n/g, "⏎").slice(0, 70)}`, isReadOnlyCommand(c) === true);
+    }
+    for (const c of needsOperator) {
+      check(`к оператору: ${c.replace(/\n/g, "⏎").slice(0, 70)}`, isReadOnlyCommand(c) === false);
+    }
+
+    // Мост: флаг включает автоодобрение, по умолчанию его нет.
+    const roLog = recordingLogger();
+    const roBridge = await startBridge({
+      sensitiveTools: ["Bash", "Monitor"],
+      autoApproveReadOnly: true,
+      logger: roLog,
+    });
+    try {
+      const grepCall = await hookPost(roBridge.url, bashCall("grep -rn Reconcil backend | head"));
+      check(
+        "читающая команда при autoApproveReadOnly проходит без записи в реестре",
+        grepCall.permissionDecision === "allow" && roBridge.list().length === 0,
+        JSON.stringify(grepCall),
+      );
+      check(
+        "в логе auto_allowed с rule: read_only",
+        roLog.records.some((r) => r.decision === "auto_allowed" && r.rule === "read_only"),
+        JSON.stringify(roLog.records.at(-1)),
+      );
+      const writeCall = await hookPost(roBridge.url, bashCall("python3 -c \"open('x','w')\""));
+      check(
+        "нечитающая команда при autoApproveReadOnly всё равно идёт оператору",
+        writeCall.permissionDecision === "deny" && roBridge.list().length === 1,
+        JSON.stringify(writeCall),
+      );
+      const monitorCall = await hookPost(roBridge.url, {
+        hook_event_name: "PreToolUse",
+        tool_name: "Monitor",
+        tool_input: { command: "ls" },
+      });
+      check(
+        "классификатор не распространяется на Monitor",
+        monitorCall.permissionDecision === "deny",
+        JSON.stringify(monitorCall),
+      );
+    } finally {
+      roBridge.stopListening();
+    }
+    const strictBridge = await startBridge();
+    try {
+      const grepStrict = await hookPost(strictBridge.url, bashCall("grep -rn Reconcil backend | head"));
+      check(
+        "без autoApproveReadOnly читающая команда идёт оператору",
+        grepStrict.permissionDecision === "deny" && strictBridge.list().length === 1,
+        JSON.stringify(grepStrict),
+      );
+    } finally {
+      strictBridge.stopListening();
+    }
+  }
+
+  console.log("\n2e-absent. HookBridge: оператор не выходит на связь");
+  {
+    let absentMs = null; // null — оператор на связи
+    const absLog = recordingLogger();
+    const absBridge = await startBridge({ operatorAbsentMs: () => absentMs, logger: absLog });
+    try {
+      // Пока оператор на связи — обычный путь: запрос ждёт решения.
+      const early = await hookPost(absBridge.url, bashCall("npm run build"));
+      check(
+        "при операторе на связи запрос ждёт решения, как раньше",
+        early.permissionDecision === "deny" &&
+          absBridge.list()[0]?.decision === "pending" &&
+          absBridge.list()[0]?.operatorAbsent === false,
+        JSON.stringify(early),
+      );
+      // Одобрим другой запрос заранее — он должен проходить и без оператора.
+      await hookPost(absBridge.url, bashCall("npm test"));
+      const testReq = absBridge.list().find((r) => r.summary === "npm test");
+      absBridge.resolve(testReq.requestId, "allow");
+
+      absentMs = 12 * 60_000;
+      const retry = await hookPost(absBridge.url, bashCall("npm run build"));
+      const buildReq = absBridge.list().find((r) => r.summary === "npm run build");
+      check(
+        "ждущий запрос при молчащем операторе закрывается окончательным отказом",
+        retry.permissionDecision === "deny" &&
+          /не выходит на связь уже 12 мин/.test(retry.permissionDecisionReason) &&
+          /перечислите в итоговом отчёте/.test(retry.permissionDecisionReason) &&
+          buildReq.decision === "denied" &&
+          buildReq.operatorAbsent === true,
+        JSON.stringify({ retry, buildReq }),
+      );
+      const fresh = await hookPost(absBridge.url, bashCall("docker compose up -d"));
+      const freshReq = absBridge.list().find((r) => r.summary === "docker compose up -d");
+      check(
+        "новый запрос при молчащем операторе отклоняется сразу, но попадает в реестр",
+        fresh.permissionDecision === "deny" &&
+          /не выходит на связь/.test(fresh.permissionDecisionReason) &&
+          freshReq?.decision === "denied" &&
+          freshReq.operatorAbsent === true,
+        JSON.stringify({ fresh, freshReq }),
+      );
+      const approvedStill = await hookPost(absBridge.url, bashCall("npm test"));
+      check(
+        "одобренный ранее запрос проходит и без оператора",
+        approvedStill.permissionDecision === "allow",
+        JSON.stringify(approvedStill),
+      );
+      const again = await hookPost(absBridge.url, bashCall("docker compose up -d"));
+      check(
+        "повтор отклонённого за отсутствием остаётся отказом",
+        again.permissionDecision === "deny",
+        JSON.stringify(again),
+      );
+      check(
+        "в логе отказ за отсутствием помечен operator_absent",
+        absLog.records.some((r) => r.event === "hook" && r.decision === "denied" && r.operator_absent === true),
+        JSON.stringify(absLog.records.at(-1)),
+      );
+    } finally {
+      absBridge.stopListening();
+    }
+
+    // Механизм выключен (или оператор на связи) — поведение прежнее.
+    const offBridge = await startBridge({ operatorAbsentMs: () => null });
+    try {
+      const r = await hookPost(offBridge.url, bashCall("npm run build"));
+      check(
+        "без отсутствия оператора запрос остаётся pending",
+        r.permissionDecision === "deny" && offBridge.list()[0]?.decision === "pending",
+        JSON.stringify(r),
+      );
+    } finally {
+      offBridge.stopListening();
+    }
   }
 
   console.log("\n2e+. HookBridge: удержание вызова до решения оператора");
@@ -4080,6 +4338,10 @@ try {
         defaultWaitSeconds: 0,
         // Сценарий держит до пяти идущих задач разом; предел здесь не предмет проверки.
         maxConcurrent: 10,
+        // Хуки включены ради проверки get_bridge_info; поддельный claude их не вызывает.
+        hooksEnabled: true,
+        operatorAbsentMinutes: 7,
+        autoApproveCommands: ["npm run build 2>&1 | tail -20"],
         logFile: join(workspace, "logs", "fake.jsonl"),
       }),
     );
@@ -4111,6 +4373,18 @@ try {
     };
 
     try {
+      const finfo = frep(await fcall("get_bridge_info", {}));
+      check(
+        "get_bridge_info при включённых хуках отдаёт настройки разрешений и списки дословно",
+        finfo.permissions.hooks_enabled === true &&
+          finfo.permissions.operator_absent_minutes === 7 &&
+          finfo.permissions.auto_approve_commands?.[0] === "npm run build 2>&1 | tail -20" &&
+          finfo.permissions.plan_hooked_tools?.join(",") === "Bash,Monitor" &&
+          finfo.permissions.plan_auto_approve_read_only === true &&
+          /7 мин/.test(finfo.next_step),
+        JSON.stringify(finfo.permissions),
+      );
+
       // Новая сессия: её id известен только из строки init потока.
       const a = frep(await fcall("plan_task", { task_text: "долгая", project_dir: projectDir }));
       let sidA = null;
@@ -4119,6 +4393,30 @@ try {
         if (!sidA) await pause(100);
       }
       check("задача идёт, session_id пришёл из init", a.status === "running" && !!sidA, String(sidA));
+
+      // list_tasks: потерянный process_id находится без чтения лога.
+      const listed = frep(await fcall("list_tasks", { status: "running" }));
+      const listedA = listed.tasks.find((t) => t.process_id === a.process_id);
+      check(
+        "list_tasks показывает идущую задачу с process_id, session_id и выжимкой",
+        listedA?.status === "running" &&
+          listedA.tool === "plan_task" &&
+          listedA.session_id === sidA &&
+          listedA.task_preview === "долгая" &&
+          typeof listed.server_started_at === "string" &&
+          /get_task_status/.test(listed.next_step),
+        JSON.stringify(listed),
+      );
+      const otherDir = frep(
+        await fcall("list_tasks", { project_dir: workspace, status: "running" }),
+      );
+      check(
+        "list_tasks фильтрует по project_dir",
+        otherDir.count === 0 && otherDir.total_matching === 0,
+        JSON.stringify(otherDir),
+      );
+      const outsideDir = await fcall("list_tasks", { project_dir: "/etc" });
+      check("list_tasks отклоняет каталог вне белого списка", outsideDir.isError === true);
 
       const resumeA = await fcall("plan_task", { task_text: "x", project_dir: projectDir, session_id: sidA });
       check(
@@ -4186,6 +4484,23 @@ try {
       if (resumeAfter.isError !== true) await stopJob(frep(resumeAfter).process_id);
       await stopJob(d.process_id);
       for (const r of started) await stopJob(frep(r).process_id);
+
+      const afterAll = frep(await fcall("list_tasks", {}));
+      check(
+        "после остановки list_tasks не видит идущих, но помнит завершённые, новые первыми",
+        afterAll.tasks.every((t) => t.status !== "running") &&
+          afterAll.tasks.some((t) => t.process_id === a.process_id && t.status === "canceled") &&
+          afterAll.tasks.every(
+            (t, i, arr) => i === 0 || arr[i - 1].started_at >= t.started_at,
+          ),
+        JSON.stringify(afterAll.tasks.map((t) => [t.status, t.started_at])),
+      );
+      const limited = frep(await fcall("list_tasks", { limit: 2 }));
+      check(
+        "limit ограничивает выдачу, total_matching — нет",
+        limited.count === 2 && limited.total_matching > 2,
+        JSON.stringify({ count: limited.count, total: limited.total_matching }),
+      );
     } finally {
       await fakeClient.close();
     }
