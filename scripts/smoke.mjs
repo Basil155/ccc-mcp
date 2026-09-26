@@ -4322,6 +4322,12 @@ try {
       /построй план этой работы и не выполняй её/.test(PLAN_SYSTEM_PROMPT),
   );
   check("в подсказке выполнения границы планирования нет", !/этап разведки и плана/.test(EXECUTE_SYSTEM_PROMPT));
+  check(
+    "обе подсказки велят запускать канонические команды из CLAUDE.md дословно",
+    [PLAN_SYSTEM_PROMPT, EXECUTE_SYSTEM_PROMPT].every(
+      (p) => /канонические команды/.test(p) && /точное совпадение строки/.test(p),
+    ),
+  );
 
   console.log("\n5b. Одна сессия — одна идущая задача (поддельный claude)");
   if (process.platform === "win32") {
